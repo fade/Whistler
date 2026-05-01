@@ -137,7 +137,7 @@ Multiple `defprog` forms compile into a single ELF with separate sections.
 
 **Parameters:**
 - `:type` — Program type: `:xdp`, `:socket-filter`, `:tracepoint`, `:kprobe`,
-  `:cgroup-skb`, `:cgroup-sock`, `:cgroup-sock-addr`
+  `:cgroup-skb`, `:cgroup-sock`, `:cgroup-sock-addr`, `:lsm`
 - `:section` — ELF section name (defaults to lowercase type name)
 - `:license` — License string (must be `"GPL"` for GPL-only helpers)
 
@@ -915,7 +915,12 @@ for direct syscall access.
 (whistler/loader:attach-xdp prog-fd interface-name)
 (whistler/loader:attach-tc prog-fd interface-name :direction "egress")
 (whistler/loader:attach-cgroup prog-fd cgroup-path attach-type)
+(whistler/loader:attach-lsm prog-fd)
 ```
+
+LSM programs use `lsm/` section names (e.g., `lsm/socket_create`). The loader
+resolves the BTF func ID automatically from `/sys/kernel/btf/vmlinux` and
+attaches via `BPF_LINK_CREATE`.
 
 Cgroup programs require an attach type constant:
 
@@ -978,6 +983,16 @@ and calls `attach-cgroup` automatically:
     1)  ; SK_PASS
   (bpf:attach count-egress "/sys/fs/cgroup")
   (loop repeat 5 do (sleep 1) (format t "~d~%" (bpf:map-ref pkt-count 0))))
+```
+
+LSM programs also work in sessions — no target argument needed for `bpf:attach`:
+
+```lisp
+(whistler/loader:with-bpf-session ()
+  (bpf:prog deny-unshare (:type :lsm :section "lsm/userns_create" :license "GPL")
+    (return -1))  ; -EPERM
+  (bpf:attach deny-unshare)
+  (sleep 30))
 ```
 
 ## Cookbook
