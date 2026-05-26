@@ -315,6 +315,20 @@
             (read-vmlinux-btf
              (or *vmlinux-btf-path* "/sys/kernel/btf/vmlinux")))))
 
+(defun reset-vmlinux-btf-cache ()
+  "Drop any cached parse of /sys/kernel/btf/vmlinux so the next
+   import-kernel-struct (or context-field) expansion re-reads the running
+   kernel's BTF. Call this when reusing a saved SBCL image on a host with a
+   different kernel than the build host."
+  (setf *vmlinux-btf-cache* nil)
+  (values))
+
+;; Reset the cache automatically on every image restart so a Lisp image saved
+;; on one kernel reads the target host's BTF on startup. Also trim the cache
+;; before save to keep image size small.
+(pushnew 'reset-vmlinux-btf-cache sb-ext:*init-hooks*)
+(pushnew 'reset-vmlinux-btf-cache sb-ext:*save-hooks*)
+
 ;;; Install BTF resolver for context field lookup.
 ;;; Returns nil (triggering static table fallback) when BTF is unavailable.
 (setf whistler/compiler:*ctx-btf-resolver*

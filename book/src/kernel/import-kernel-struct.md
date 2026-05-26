@@ -73,6 +73,22 @@ The offsets come from the build host's BTF. For CO-RE relocatable programs,
 use `core-load` / `core-ctx-load` instead. `import-kernel-struct` is best
 suited for programs that will run on the same kernel they were compiled on.
 
+## Saved SBCL images
+
+If you ship a saved SBCL image (`sb-ext:save-lisp-and-die`) containing the
+Whistler compiler and compile BPF programs on each target host, the parsed
+BTF needs to come from the *target* kernel, not the build host's. The cache
+is invalidated automatically on image restart via `sb-ext:*init-hooks*`, and
+trimmed before save via `sb-ext:*save-hooks*`. Call
+`reset-vmlinux-btf-cache` manually if you need to force a re-read mid-session
+(e.g. after switching `*vmlinux-btf-path*`).
+
+Note that anything *already macroexpanded* into the image — every
+`import-kernel-struct` accessor, every `defprog`, every `(ctx field)` access
+— bakes the build host's offsets into the generated code. Those won't
+refresh. The supported workflow is: ship an image containing the compiler
+only, call `defprog` / `compile-file*` on each target.
+
 ## Example
 
 ```lisp
