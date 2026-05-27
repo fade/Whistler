@@ -111,14 +111,62 @@
                (string= (subseq tail 0 5) "freq_"))
       (parse-integer tail :start 5 :junk-allowed t))))
 
+(defun resolve-uprobe-library (name)
+  "Map a bare library name like `libpthread' / `libc' to a real
+   filesystem path. bpftrace accepts these unqualified — the dynamic
+   linker resolves them via ldconfig. We do the same: shell out to
+   `ldconfig -p', match `lib<name>.so*' or `<name>.so*' lines, and
+   return the first path. Falls back to NAME unchanged if no match,
+   so absolute paths and exotic targets still flow through."
+  (cond
+    ;; Already a path — has a slash anywhere.
+    ((position #\/ name) name)
+    (t
+     (let ((normalized (if (and (>= (length name) 3)
+                                (string= (subseq name 0 3) "lib"))
+                           name
+                           (concatenate 'string "lib" name))))
+       (or (ldconfig-lookup normalized) name)))))
+
+(defun ldconfig-lookup (libname)
+  "Run `ldconfig -p' and find the canonical path for LIBNAME (e.g.
+   `libpthread' returns `/lib64/libpthread.so.0'). NIL if not found."
+  (let* ((proc-out
+           (with-output-to-string (out)
+             (or (ignore-errors
+                  (sb-ext:run-program "/sbin/ldconfig" '("-p")
+                                      :output out :wait t :error nil))
+                 (ignore-errors
+                  (sb-ext:run-program "/usr/sbin/ldconfig" '("-p")
+                                      :output out :wait t :error nil))))))
+    (with-input-from-string (in proc-out)
+      (loop for line = (read-line in nil nil)
+            while line
+            for trimmed = (string-trim '(#\Space #\Tab) line)
+            for arrow = (search " => " trimmed)
+            for sp    = (and arrow (position #\Space trimmed))
+            when (and arrow sp (< sp arrow))
+              do (let* ((name-part (subseq trimmed 0 sp))
+                        (path (subseq trimmed (+ arrow 4))))
+                   (when (or (string= name-part libname)
+                             (and (>= (length name-part) (+ (length libname) 3))
+                                  (string= (subseq name-part 0 (length libname))
+                                           libname)
+                                  (string= (subseq name-part (length libname)
+                                                   (+ (length libname) 3))
+                                           ".so")))
+                     (return path)))
+            finally (return nil)))))
+
 (defun parse-uprobe-target (section prefix-len)
   "Split a section like `uprobe/PATH:SYMBOL' (PREFIX-LEN is 7) into
    (PATH SYMBOL). The path can contain `/' characters, so we split
-   on the LAST colon."
+   on the LAST colon. Bare library names (no slash) are resolved
+   through the dynamic linker — `libpthread' → `/lib64/libpthread.so.0'."
   (let* ((tail (subseq section prefix-len))
          (last-colon (position #\: tail :from-end t)))
     (when last-colon
-      (values (subseq tail 0 last-colon)
+      (values (resolve-uprobe-library (subseq tail 0 last-colon))
               (subseq tail (1+ last-colon))))))
 
 (defvar *session-symbolizer* nil
