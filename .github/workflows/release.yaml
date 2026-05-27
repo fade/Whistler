@@ -23,6 +23,19 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y sbcl make
 
+      - name: Install ocicl
+        run: |
+          OCICL_VERSION=$(curl -s https://api.github.com/repos/ocicl/ocicl/releases/latest \
+                          | grep '"tag_name"' \
+                          | sed -E 's/.*"v([^"]+)".*/\1/')
+          curl -sLO "https://github.com/ocicl/ocicl/releases/latest/download/ocicl_${OCICL_VERSION}-1_amd64.deb"
+          sudo dpkg -i "ocicl_${OCICL_VERSION}-1_amd64.deb"
+          ocicl setup > ~/.sbclrc
+          ocicl version
+
+      - name: Fetch Lisp dependencies
+        run: ocicl install
+
       - name: Build
         run: make
 
