@@ -992,13 +992,37 @@
 (defun lower-stmts (stmts)
   (mapcar #'lower-stmt stmts))
 
+(defconstant +bt-max-loop-iters+ 64
+  "Upper bound on bpftrace `while' iterations. The BPF verifier
+   requires a static iteration cap; we hard-code 64 — bpftrace's
+   default is similar.")
+
 (defun lower-stmt (stmt)
   (ecase (first stmt)
     (:if      (lower-if stmt))
+    (:while   (lower-while stmt))
     (:assign  (lower-assign stmt))
     (:incdec  (lower-incdec stmt))
     (:expr    (lower-expr-stmt stmt))
     (:return  (unsupported "return outside fn body"))))
+
+(defun lower-while (stmt)
+  "Lower a bpftrace `while (cond) { body }' to a bounded dotimes:
+
+       (dotimes (k +bt-max-loop-iters+)
+         (when cond
+           body…))
+
+   The BPF verifier requires a static loop bound; once `cond' goes
+   false the body is skipped on every remaining iteration. Simple
+   and verifier-friendly; bpf_loop()-style early termination is a
+   future optimisation."
+  (let* ((cond-expr (getf (cdr stmt) :cond))
+         (body      (getf (cdr stmt) :body))
+         (k         (gensym "WHILE-K")))
+    `(whistler::dotimes (,k ,+bt-max-loop-iters+)
+       (whistler::when ,(lower-expr cond-expr)
+         ,@(lower-stmts body)))))
 
 (defun lower-if (stmt)
   (let ((c (lower-expr (getf (cdr stmt) :cond)))

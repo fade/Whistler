@@ -98,8 +98,9 @@
 
   block          = <'{'> <ws> statements? <ws> <'}'>
   statements     = statement (<ws> <';'> <ws> statement)* (<ws> <';'>)?
-  statement      = if-stmt / return-stmt / assign-stmt / expr-stmt
+  statement      = if-stmt / while-stmt / return-stmt / assign-stmt / expr-stmt
   return-stmt    = <'return'> !ident-char <ws> expr?
+  while-stmt     = <'while'> !ident-char <ws> <'('> <ws> expr <ws> <')'> <ws> block
   if-stmt        = <'if'> <ws> <'('> <ws> expr <ws> <')'> <ws> block (<ws> <'else'> <ws> block)?
   assign-stmt    = lhs <ws> assign-op <ws> expr  /
                    lhs <ws> incdec-op

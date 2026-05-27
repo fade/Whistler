@@ -231,6 +231,11 @@
   (let ((inner (first (remove-if-not #'consp (children-of node)))))
     (ecase (tag-of inner)
       (:if-stmt      (norm-if inner))
+      (:while-stmt
+       (let* ((kids (remove-if-not #'consp (children-of inner)))
+              (cond-expr (norm-expr-or-expr-wrapped (first kids)))
+              (body      (norm-block (second kids))))
+         (list :while :cond cond-expr :body body)))
       (:return-stmt
        (let ((expr-node (find-if (lambda (c) (and (consp c)
                                                   (not (eq (tag-of c) :ident))))

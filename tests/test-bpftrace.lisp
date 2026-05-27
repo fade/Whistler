@@ -344,3 +344,22 @@
     (whistler/bpftrace:compile-script
      "fn id($x) { return $x; }
       kprobe:foo { @ = id(1, 2); }")))
+
+(test parse-while-loop
+  "while (cond) { body } parses to (:while :cond … :body …)."
+  (let* ((ast (whistler/bpftrace::normalize
+               (whistler/bpftrace::parse-script
+                "BEGIN { $i = 0; while ($i < 3) { $i += 1; } }")))
+         (body (getf (cdr (second ast)) :body))
+         (loop-stmt (find :while body :key #'first)))
+    (is loop-stmt)
+    (is (eq :while (first loop-stmt)))))
+
+(test codegen-while-loop
+  "while lowers to a bounded dotimes wrapping a (when cond body)."
+  (let* ((src "BEGIN { $i = 0; while ($i < 5) { $i += 1; }; exit(); }")
+         (gen (whistler/bpftrace:compile-script src))
+         (text (format nil "~S" (cdddr (first (getf gen :progs))))))
+    (is (search "DOTIMES" text))
+    (is (search "64" text)
+        "bounded by +bt-max-loop-iters+ (64)")))
