@@ -270,12 +270,15 @@
                    constant / string-lit / hex-int / integer
   (* C-style struct-pointer cast: open-paren struct ident asterisk
      close-paren expr. Must precede `parens' in the alternates so the
-     open-paren disambiguation tries the cast shape first. *)
-  cast           = <'('> <ws> <'struct'> <ws> ident <ws> <'*'> <ws> <')'> <ws> primary
-  (* Primitive C cast: (uint64)expr, (int)expr. Treated as a no-op
+     open-paren disambiguation tries the cast shape first. The cast
+     binds to a full postfix expression so a struct-pointer cast
+     followed by `.field' is parsed as `cast(args.field)' (matching
+     bpftrace), not `cast(args).field'. *)
+  cast           = <'('> <ws> <'struct'> <ws> ident <ws> <'*'> <ws> <')'> <ws> postfix
+  (* Primitive C cast: uint64 of expr, int of expr. Treated as a no-op
      since all values are u64 in our IR; preserves bpftrace
      compatibility for scripts that lean on integer narrowing. *)
-  primitive-cast = <'('> <ws> int-type-name <ws> <')'> <ws> primary
+  primitive-cast = <'('> <ws> int-type-name <ws> <')'> <ws> postfix
   int-type-name  = 'uint64' / 'uint32' / 'uint16' / 'uint8' /
                    'int64' / 'int32' / 'int16' / 'int8' /
                    'uint' / 'int'
