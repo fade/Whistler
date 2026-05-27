@@ -55,6 +55,7 @@
 
 (defconstant +bpf-prog-type-socket-filter+ 1)
 (defconstant +bpf-prog-type-kprobe+ 2)
+(defconstant +bpf-prog-type-perf-event+ 7)
 (defconstant +bpf-prog-type-sched-cls+ 3)
 (defconstant +bpf-prog-type-tracepoint+ 5)
 (defconstant +bpf-prog-type-xdp+ 6)
@@ -94,7 +95,9 @@
 
 ;;; ========== Perf event constants ==========
 
+(defconstant +perf-type-software+ 1)
 (defconstant +perf-type-tracepoint+ 2)
+(defconstant +perf-count-sw-cpu-clock+ 0)
 (defconstant +perf-sample-raw+ 1024)
 (defconstant +perf-flag-fd-cloexec+ 8)
 (defconstant +perf-event-ioc-set-bpf+ #x40042408)

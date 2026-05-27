@@ -38,6 +38,14 @@
     (push (subseq section start) parts)
     (nreverse parts)))
 
+(defun parse-interval-period-ns (section)
+  "Extract the period (in ns) from `interval/period_N' section names."
+  (let* ((parts (split-section section)) ; ("interval" "period_N")
+         (tail  (second parts)))
+    (when (and tail (>= (length tail) 7)
+               (string= (subseq tail 0 7) "period_"))
+      (parse-integer tail :start 7 :junk-allowed t))))
+
 (defun attach-probe (prog-info)
   "Inspect the program's section name and call the appropriate attach-*.
    Translates BPF errors into BPFTRACE-ATTACH-ERROR with hints."
@@ -55,7 +63,14 @@
           ((string= kind "kretprobe")
            (whistler/loader:attach-kprobe fd target :retprobe t))
           ((string= kind "tracepoint")
-           (whistler/loader:attach-tracepoint fd target))
+           (whistler/loader:attach-tracepoint fd section))
+          ((string= kind "interval")
+           (let ((period (parse-interval-period-ns section)))
+             (unless period
+               (error 'bpftrace-attach-error
+                      :section section :target target
+                      :reason "could not parse period from interval section"))
+             (whistler/loader::attach-perf-timer fd period)))
           (t (error 'bpftrace-attach-error
                     :section section :target target
                     :reason (format nil "unknown probe kind ~A" kind))))
@@ -124,12 +139,28 @@
         (dotimes (i n) (when (< i width) (setf (char out i) #\@)))
         out)))
 
-(defun format-key (key &key (parts 1))
-  "Render KEY (an integer) as bpftrace does. For composite keys (PARTS > 1)
-   we recovered KEY by decoding 8*PARTS little-endian bytes into one big
-   integer — split it back into PARTS 8-byte components and render as
-   `a, b`. For scalar keys, bare decimal."
+(defun bignum->comm-string (key)
+  "Treat KEY as 16 little-endian bytes (a `comm' value) and convert
+   the prefix up to the first NUL byte to a Lisp string."
+  (let ((bytes (loop for i below 16
+                     collect (logand (ash key (* i -8)) #xff))))
+    (let ((end (or (position 0 bytes) 16)))
+      (sb-ext:octets-to-string
+       (coerce (subseq bytes 0 end) '(simple-array (unsigned-byte 8) (*)))
+       :external-format :utf-8))))
+
+(defun format-key (key &key (parts 1) key-builtin)
+  "Render KEY (an integer) as bpftrace does.
+   * scalar (PARTS=1): bare decimal — unless KEY-BUILTIN is :comm,
+     in which case it's actually a 16-byte string masquerading as
+     a 2-part integer that the caller forgot to split. (We won't
+     hit this case in practice; the caller splits first.)
+   * composite (PARTS>1): split into 8-byte chunks and render. When
+     KEY-BUILTIN is :comm, the whole 16-byte key is a single string,
+     not two integer slots — render it as ASCII."
   (cond
+    ((eq key-builtin :comm)
+     (format nil "~A" (bignum->comm-string key)))
     ((<= parts 1) (format nil "~D" key))
     (t
      (with-output-to-string (s)
@@ -174,20 +205,71 @@
                      count
                      (render-bar count maxc 52)))))
 
-(defun print-scalar-map (label info &key (key-parts 1) keyed-p)
-  "Print a hash map's contents in bpftrace's END-dump style.
-   KEY-PARTS > 1 means a composite key — split the bignum back into
-   8-byte components. KEYED-P=NIL means the script never used `[k]`
-   (bare `@m = …`); bpftrace renders those as `@m: value` without the
-   `[index]` part."
+(defun lookup-percpu-u64s (info key &optional (n-fields 1))
+  "For a percpu map, look up KEY and return a list of u64s, one per
+   field (in declaration order across all CPUs reduced however the
+   caller wants). Each per-CPU value is N-FIELDS u64s (1 for sum,
+   2 for avg/min/max). Returns ((cpu-fields …) per-cpu)."
+  (let* ((kbytes (whistler/loader::encode-int-key
+                  key (whistler/loader::map-info-key-size info)))
+         (per    (whistler/loader::map-lookup info kbytes)))
+    (when (and per (vectorp per))
+      (loop for cpu-val across per
+            collect (loop for i below n-fields
+                          collect (let ((bytes (subseq cpu-val (* i 8) (+ (* i 8) 8))))
+                                    (whistler/loader::decode-int-value bytes)))))))
+
+(defun reduce-sum (info key)
+  (loop for cpu-fields in (lookup-percpu-u64s info key 1)
+        sum (first cpu-fields)))
+
+(defun reduce-avg (info key)
+  "Returns (values count sum)."
+  (let ((count 0) (sum 0))
+    (dolist (cpu-fields (lookup-percpu-u64s info key 2))
+      (incf count (first cpu-fields))
+      (incf sum   (second cpu-fields)))
+    (values count sum)))
+
+(defun reduce-min/max (info key mode)
+  "Returns the min or max across CPUs of the cpus that have is_set=1."
+  (let ((cur nil))
+    (dolist (cpu-fields (lookup-percpu-u64s info key 2))
+      (let ((v (first cpu-fields))
+            (set (second cpu-fields)))
+        (when (plusp set)
+          (setf cur (cond ((null cur) v)
+                          ((eq mode :min) (min cur v))
+                          (t (max cur v)))))))
+    (or cur 0)))
+
+(defun print-scalar-map (label info &key (key-parts 1) keyed-p
+                                          (kind :counter) key-builtin)
+  "Print a hash or percpu-hash map's contents in bpftrace's END-dump
+   style. KIND controls how the value is decoded; KEY-BUILTIN is the
+   codegen-time hint for the key shape (e.g. :comm renders ASCII)."
   (let* ((keys (map-keys info))
-         (pairs (sort (mapcar (lambda (k) (cons k (lookup-int info k))) keys)
+         (pairs (sort (mapcar
+                       (lambda (k)
+                         (cons k (case kind
+                                   (:sum (reduce-sum info k))
+                                   (:avg (multiple-value-bind (c s)
+                                             (reduce-avg info k)
+                                           (if (zerop c) 0 (floor s c))))
+                                   ((:min) (reduce-min/max info k :min))
+                                   ((:max) (reduce-min/max info k :max))
+                                   (t     (lookup-int info k)))))
+                       keys)
                       #'< :key #'cdr))
          (prefix (if (or (null label) (string= label "@")) "@" (format nil "@~A" label))))
     (dolist (kv pairs)
       (if keyed-p
           (format t "~A[~A]: ~D~%"
-                  prefix (format-key (car kv) :parts key-parts) (cdr kv))
+                  prefix
+                  (format-key (car kv)
+                              :parts key-parts
+                              :key-builtin key-builtin)
+                  (cdr kv))
           (format t "~A: ~D~%" prefix (cdr kv))))))
 
 (defun print-all-maps (info-list map-alist)
@@ -206,7 +288,9 @@
           (:hist (print-hist raw-name mapinfo))
           (t     (print-scalar-map raw-name mapinfo
                                    :key-parts key-parts
-                                   :keyed-p (getf (cdr info-rec) :keyed-p))))))))
+                                   :keyed-p (getf (cdr info-rec) :keyed-p)
+                                   :key-builtin (getf (cdr info-rec) :key-builtin)
+                                   :kind kind)))))))
 
 ;;; ========== Userspace BEGIN/END ==========
 
@@ -262,10 +346,9 @@
   (if (>= u (ash 1 63)) (- u (ash 1 64)) u))
 
 (defun format-printf (fmt args)
-  "Minimal C-style printf: walks FMT looking for %d/%i/%u/%lld/%llu/
-   %x/%lx/%llx/%X/%p/%c/%% specifiers and consumes one ARG each. %s
-   is not supported in Phase 1 (would require pulling string bytes
-   through the ringbuf). Returns the formatted output string."
+  "C-style printf. ARGS is a list whose entries match the printf-table's
+   per-arg type list: ints come through as integers, strings come
+   through as Lisp strings. Supports %d/%i/%u/%lld/%llu/%x/%X/%p/%c/%s/%%."
   (with-output-to-string (s)
     (loop with i = 0
           with n = (length fmt)
@@ -275,51 +358,122 @@
           do (cond
                ((not (char= c #\%))
                 (write-char c s) (incf i))
-               ;; Two-char sequences
                ((and (< (1+ i) n) (char= (char fmt (1+ i)) #\%))
                 (write-char #\% s) (incf i 2))
-               ;; Parse [%][l|ll][d|i|u|x|X|p|c|s]
                (t
                 (let ((j (1+ i)))
-                  ;; consume "l" or "ll"
                   (loop while (and (< j n) (char= (char fmt j) #\l))
                         do (incf j))
                   (when (>= j n) (write-char c s) (return))
                   (let ((spec (char fmt j))
                         (arg  (pop rest)))
                     (case spec
-                      ((#\d #\i)
-                       (format s "~D" (signed-64 (or arg 0))))
-                      ((#\u)
-                       (format s "~D" (or arg 0)))
-                      ((#\x #\p)
-                       (format s "~(~X~)" (or arg 0)))
-                      ((#\X)
-                       (format s "~X" (or arg 0)))
-                      ((#\c)
-                       (write-char (code-char (logand (or arg 0) #xff)) s))
-                      ((#\s)
-                       (write-string "<str>" s))
-                      (t
-                       (write-char #\% s)
-                       (write-char spec s))))
+                      ((#\d #\i) (format s "~D" (signed-64 (or arg 0))))
+                      ((#\u)     (format s "~D" (or arg 0)))
+                      ((#\x #\p) (format s "~(~X~)" (or arg 0)))
+                      ((#\X)     (format s "~X" (or arg 0)))
+                      ((#\c)     (write-char (code-char (logand (or arg 0) #xff)) s))
+                      ((#\s)     (write-string (if (stringp arg) arg "") s))
+                      (t (write-char #\% s) (write-char spec s))))
                   (setf i (1+ j))))))))
 
-(defun make-printf-callback (printf-table)
-  "Return a lambda suitable for OPEN-RING-CONSUMER: pops an event from
-   the ringbuf, looks up its format string in PRINTF-TABLE, and writes
-   the formatted output to stdout."
+(defun sap-read-string-fixed (sap offset max-len)
+  "Read MAX-LEN bytes from (SAP+OFFSET), trim at the first NUL, return
+   a Lisp string (assumed ASCII / UTF-8 clean for the `comm' use case)."
+  (let ((bytes (make-array max-len :element-type '(unsigned-byte 8))))
+    (dotimes (i max-len)
+      (setf (aref bytes i) (sb-sys:sap-ref-8 sap (+ offset i))))
+    (let ((end (or (position 0 bytes) max-len)))
+      (sb-ext:octets-to-string bytes :end end :external-format :utf-8))))
+
+(defun decode-printf-record (sap printf-table)
+  "Pop a tag=0 (printf) record off the ringbuf and write its formatted
+   text to stdout. SAP points at the start of the record; the u32 tag
+   has already been read."
+  (let* ((id    (sap-read-u32-le sap 4))
+         (entry (find id printf-table :key #'first :test #'=)))
+    (when entry
+      (let* ((fmt   (second entry))
+             (types (third entry))
+             (args  (let ((off 8))
+                      (loop for ty in types
+                            collect (ecase ty
+                                      (:int
+                                       (prog1 (sap-read-u64-le sap off)
+                                         (incf off 8)))
+                                      (:string
+                                       (prog1 (sap-read-string-fixed
+                                               sap off 16)
+                                         (incf off 16))))))))
+        (write-string (format-printf fmt args))))))
+
+;;; print/clear are async actions whose body runs userspace-side.
+;;; The kernel side just emits a tagged ringbuf record; the runtime
+;;; uses the map-id from the record to find the right map-info and
+;;; calls into the existing print path or walks-and-deletes the map.
+
+(defun find-map-by-id (map-id-table id map-alist info-list)
+  "Resolve a (tag, map-id) record to (raw-name map-info info-rec)."
+  (let* ((cell  (find id map-id-table :key #'cdr :test #'=))
+         (msym  (car cell)))
+    (when msym
+      (let* ((key (string-downcase (substitute #\_ #\- (symbol-name msym))))
+             (info-rec (find-if
+                        (lambda (ir)
+                          (eq (getf (cdr ir) :name) msym))
+                        info-list))
+             (entry (assoc key map-alist :test #'string=)))
+        (values (first info-rec) (cdr entry) info-rec)))))
+
+(defun decode-print-map-record (sap map-id-table map-alist info-list)
+  (let ((id (sap-read-u32-le sap 4)))
+    (multiple-value-bind (raw map-info info-rec)
+        (find-map-by-id map-id-table id map-alist info-list)
+      (when map-info
+        (case (getf (cdr info-rec) :kind)
+          (:hist (print-hist raw map-info))
+          (t     (print-scalar-map
+                  raw map-info
+                  :key-parts (or (getf (cdr info-rec) :key-parts) 1)
+                  :keyed-p   (getf (cdr info-rec) :keyed-p)
+                  :key-builtin (getf (cdr info-rec) :key-builtin)
+                  :kind      (getf (cdr info-rec) :kind))))))))
+
+(defun decode-clear-map-record (sap map-id-table map-alist)
+  (let ((id (sap-read-u32-le sap 4)))
+    (let* ((cell  (find id map-id-table :key #'cdr :test #'=))
+           (msym  (car cell)))
+      (when msym
+        (let* ((key (string-downcase (substitute #\_ #\- (symbol-name msym))))
+               (entry (assoc key map-alist :test #'string=))
+               (info (cdr entry)))
+          (when info
+            (dolist (k (map-keys info))
+              (handler-case
+                  (whistler/loader::map-delete
+                   info (whistler/loader::encode-int-key
+                         k (whistler/loader::map-info-key-size info)))
+                (error () nil)))))))))
+
+(defun decode-time-record ()
+  (multiple-value-bind (sec _msec _usec _yr _mo _day) (get-decoded-time)
+    (declare (ignore _msec _usec _yr _mo _day))
+    (multiple-value-bind (s m h) (decode-universal-time (get-universal-time))
+      (declare (ignore sec))
+      (format t "~2,'0D:~2,'0D:~2,'0D~%" h m s))))
+
+(defun make-ring-callback (printf-table map-id-table map-alist info-list)
+  "Build the dispatcher that READ_RING_BUFFER invokes for every record."
   (lambda (sap len)
     (declare (ignore len))
-    (let* ((id   (sap-read-u32-le sap 0))
-           (n    (sap-read-u32-le sap 4))
-           (entry (find id printf-table :key #'first :test #'=)))
-      (when entry
-        (let ((fmt   (second entry))
-              (args  (loop for k below n
-                           collect (sap-read-u64-le sap (+ 8 (* k 8))))))
-          (write-string (format-printf fmt args))
-          (force-output))))))
+    (let ((tag (sap-read-u32-le sap 0)))
+      (case tag
+        (0 (decode-printf-record    sap printf-table))
+        (1 (decode-print-map-record sap map-id-table map-alist info-list))
+        (2 (decode-clear-map-record sap map-id-table map-alist))
+        (3 (decode-time-record))
+        (t nil)))
+    (force-output)))
 
 (defun test-run-section-p (section)
   "T iff SECTION is one of our synthetic BEGIN/END sections."
@@ -350,10 +504,14 @@
            (exit-info  (find-exit-map gen map-alist))
            (print-info (find-print-map gen map-alist))
            (printf-table (getf gen :printf-table))
+           (map-id-table (getf gen :map-id-table))
+           (info-list-cached info-list)
            (ring-consumer
              (when print-info
                (whistler/loader::open-ring-consumer
-                print-info (make-printf-callback printf-table))))
+                print-info
+                (make-ring-callback printf-table map-id-table
+                                    map-alist info-list-cached))))
            (begin-progs (remove-if-not
                          (lambda (entry)
                            (begin-section-p

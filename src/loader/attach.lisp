@@ -125,6 +125,19 @@
       (error "Cannot resolve tracepoint ID for ~a (tried ~a)" tracepoint-name path))
     id))
 
+(defun attach-perf-timer (prog-fd period-ns)
+  "Attach PROG-FD to a periodic PERF_TYPE_SOFTWARE / CPU_CLOCK event
+   firing every PERIOD-NS nanoseconds. Used to wire up bpftrace's
+   `interval:s:N` / `interval:ms:N`. Returns an attachment record.
+   Phase 3 fires on CPU 0 only — sufficient for periodic reporting."
+  (let ((attr (make-perf-attr +perf-type-software+
+                              +perf-count-sw-cpu-clock+)))
+    ;; sample_period at offset 16
+    (put-u64 attr 16 period-ns)
+    ;; flags u64 at offset 40 — leave zero so freq=0 (period mode)
+    (let ((fds (attach-perf-bpf attr prog-fd)))
+      (make-attachment :type :perf-timer :perf-fds fds :prog-fd prog-fd))))
+
 (defun attach-tracepoint (prog-fd tracepoint-name)
   "Attach a BPF program to a tracepoint.
    TRACEPOINT-NAME is e.g. \"tracepoint/sched/sched_process_fork\"

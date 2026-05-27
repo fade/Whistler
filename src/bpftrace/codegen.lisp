@@ -78,6 +78,7 @@
     (:retval  8)
     (:var     8)
     (:bin     8)
+    (:comm    16)
     (:field
      (let ((name (getf (cdr expr) :name)))
        (cond
@@ -117,18 +118,26 @@
        identical layouts, so lookups match writes.
 
    Returns (values LAYOUT TOTAL-BYTES). Each layout entry is
-   (OFFSET 8 U64-TYPE-SYM EXPR)."
-  (let ((u64 (size->type 8)))
-    (values (loop for e in keys
-                  for offset from 0 by 8
-                  collect (list offset 8 u64 e))
-            (* 8 (length keys)))))
+   (OFFSET SIZE TYPE-SYM EXPR) — SIZE is 8 for plain values, 16 for
+   `comm' (the only string-typed key today; the kernel fills the 16
+   bytes via bpf_get_current_comm)."
+  (let ((u64 (size->type 8))
+        (u8  (size->type 1))
+        (offset 0))
+    (values
+     (loop for e in keys
+           for size = (if (eq (first e) :comm) +bt-comm-len+ 8)
+           for type = (if (eq (first e) :comm) u8 u64)
+           collect (list offset size type e)
+           do (incf offset size))
+     offset)))
 
 (defun key-hint (expr)
   (case (first expr)
     (:builtin (second expr))
     (:arg     :arg)
     (:retval  :retval)
+    (:comm    :comm)
     (t        nil)))
 
 (defun infer-maps (script)
@@ -150,9 +159,19 @@
                      (keys (getf (cdr mref) :keys)))
                  (when keys
                    (setf (minfo-keyed-p info) t)
-                   (multiple-value-bind (_layout total)
-                       (composite-key-layout keys)
-                     (declare (ignore _layout))
+                   ;; A single non-:comm key follows with-key's scalar
+                   ;; path — the lowering stores it at its natural
+                   ;; width via map-update (`expr-size'). Composite
+                   ;; (or :comm) keys go through the struct-key path
+                   ;; where every slot is u64, so use the layout total.
+                   (let ((total
+                           (if (and (= (length keys) 1)
+                                    (not (eq (first (first keys)) :comm)))
+                               (expr-size (first keys))
+                               (multiple-value-bind (_layout total)
+                                   (composite-key-layout keys)
+                                 (declare (ignore _layout))
+                                 total))))
                      (setf (minfo-key-size info)
                            (max (minfo-key-size info) total)))
                    (when (and (null (minfo-key-builtin info))
@@ -173,7 +192,18 @@
                         ((string= fn "lhist")
                          (setf (minfo-kind info) :hist
                                (minfo-key-size info) 4
-                               (minfo-max-entries info) 256)))))
+                               (minfo-max-entries info) 256))
+                        ((string= fn "sum")
+                         (setf (minfo-kind info) :sum))
+                        ((string= fn "min")
+                         (setf (minfo-kind info) :min
+                               (minfo-value-size info) 16))
+                        ((string= fn "max")
+                         (setf (minfo-kind info) :max
+                               (minfo-value-size info) 16))
+                        ((string= fn "avg")
+                         (setf (minfo-kind info) :avg
+                               (minfo-value-size info) 16)))))
                    (t (when (eq (minfo-kind info) :counter)
                         (setf (minfo-kind info) :scalar)))))))
       (dolist (probe (rest script))
@@ -212,11 +242,16 @@
 
 (defun gen-defmap (info)
   (let ((mtype (case (minfo-kind info)
-                 (:hist :percpu-array)
-                 (t     :hash))))
+                 (:hist                    :percpu-array)
+                 ;; sum/min/max/avg use percpu-hash so concurrent
+                 ;; updates from different CPUs don't race (no atomics
+                 ;; needed; userspace reduces across CPUs at print time).
+                 ((:sum :avg :min :max)    :percpu-hash)
+                 (t                        :hash))))
     `(whistler:defmap ,(minfo-name info)
        :type ,mtype
-       :key-size ,(if (eq mtype :percpu-array) 4 (max 1 (minfo-key-size info)))
+       :key-size ,(cond ((eq mtype :percpu-array) 4)
+                        (t (max 1 (minfo-key-size info))))
        :value-size ,(minfo-value-size info)
        :max-entries ,(or (minfo-max-entries info)
                          (if (eq mtype :percpu-array) 64 1024)))))
@@ -234,7 +269,7 @@
     (:builtin    (lower-builtin (second expr)))
     (:arg        (lower-arg (second expr)))
     (:retval     (lower-retval))
-    (:comm       (unsupported "comm in expression position"))
+    (:comm       (unsupported "comm only usable as printf arg or @map[comm] key"))
     (:args       (unsupported "args without ->field"))
     (:probe-name (unsupported "probe builtin"))
     (:func       (unsupported "func builtin"))
@@ -318,16 +353,28 @@
   "Hidden array map used as a kernel→user `exit()` flag.")
 
 (defparameter *print-map-name* (intern "--BT-PRINT--" :whistler)
-  "Hidden ringbuf map used to ferry kernel-side printf records back
-   to the userspace runtime, which formats and writes them to stdout.")
+  "Hidden ringbuf map used to ferry kernel-side `async actions' back
+   to the userspace runtime: printf, print(@m), clear(@m), time, etc.
+   Every record starts with the same 8-byte header — a u32 tag and
+   a u32 id — so a single ring consumer can dispatch all of them.")
+
+;;; Tag values must match those decoded in runtime.lisp.
+(defconstant +bt-tag-printf+    0)
+(defconstant +bt-tag-print-map+ 1)
+(defconstant +bt-tag-clear-map+ 2)
+(defconstant +bt-tag-time+      3)
 
 (defvar *printf-table* nil
-  "Per-generate() list of (ID . (FMT-STRING ARG-COUNT)) entries. The
-   runtime gets this verbatim and uses ID to recover the format
-   string when it pops a record off the ringbuf.")
+  "Per-generate() list of (ID FMT-STRING ARG-TYPES) entries.
+   ARG-TYPES is a list of :int or :string, one per format-string
+   arg. Runtime decodes records by walking this list.")
 
 (defvar *printf-id-counter* 0
-  "Per-generate() counter for unique printf event IDs.")
+  "Per-generate() counter for unique printf record IDs.")
+
+(defvar *map-id-table* nil
+  "Per-generate() alist mapping `whistler symbol' → integer id for
+   the map-id field on print-map / clear-map records.")
 
 (defun lower-call (expr)
   (let ((name (getf (cdr expr) :name)))
@@ -339,42 +386,113 @@
        ;; Set the exit flag the userspace print loop polls every tick.
        `(setf (whistler:getmap ,*exit-map-name* 0) 1))
       ((string= name "printf") (lower-printf (getf (cdr expr) :args)))
-      ((string= name "clear") 0)
-      ((string= name "zero")  0)
+      ((string= name "print")  (lower-async-map +bt-tag-print-map+
+                                                (getf (cdr expr) :args)
+                                                "print"))
+      ((string= name "clear")  (lower-async-map +bt-tag-clear-map+
+                                                (getf (cdr expr) :args)
+                                                "clear"))
+      ((string= name "zero")   0)
+      ((string= name "time")   (lower-async-time
+                                (getf (cdr expr) :args)))
       ((string= name "delete") 0)           ; lower-expr-stmt handles the real call
       (t (unsupported "function ~A" name)))))
 
+(defun intern-map-id (mref)
+  "Assign / look up a stable integer id for the given @map reference."
+  (let* ((info (or (gethash (or (getf (cdr mref) :name) "@") *map-table*)
+                   (unsupported "unknown map @~A in async action"
+                                (getf (cdr mref) :name))))
+         (sym (minfo-name info))
+         (cell (assoc sym *map-id-table*)))
+    (if cell (cdr cell)
+        (let ((id (1+ (length *map-id-table*))))
+          (push (cons sym id) *map-id-table*)
+          id))))
+
+(defun lower-async-map (tag args op-name)
+  "Emit a tagged ringbuf record asking userspace to print/clear/zero
+   the named map. ARGS must be one @map reference."
+  (unless (and args (= (length args) 1) (eq (first (first args)) :map))
+    (unsupported "~A() needs a single @map argument" op-name))
+  (let* ((mref (first args))
+         (map-id (intern-map-id mref))
+         (rec (gensym "REC")))
+    `(whistler:with-ringbuf (,rec ,*print-map-name* 8)
+       (whistler::store ,(intern "U32" :whistler) ,rec 0 ,tag)
+       (whistler::store ,(intern "U32" :whistler) ,rec 4 ,map-id))))
+
+(defun lower-async-time (args)
+  "Emit a tagged ringbuf record asking userspace to stamp the current
+   wall-clock time. bpftrace's time() takes an optional strftime
+   format; Phase 3 emits the time only and lets userspace use a
+   sensible default."
+  (when args
+    (unsupported "time() format strings — Phase 3 ships time() bare"))
+  (let ((rec (gensym "REC")))
+    `(whistler:with-ringbuf (,rec ,*print-map-name* 8)
+       (whistler::store ,(intern "U32" :whistler) ,rec 0 ,+bt-tag-time+)
+       (whistler::store ,(intern "U32" :whistler) ,rec 4 0))))
+
+(defconstant +bt-comm-len+ 16
+  "Bytes of `comm' the kernel writes via bpf_get_current_comm.")
+
+(defun printf-arg-type (expr)
+  "Classify a printf arg as :int (8 bytes, u64 in record) or :string
+   (16 bytes inline). Phase 3 only knows about `comm' as a string."
+  (case (first expr)
+    (:comm :string)
+    (t     :int)))
+
+(defun printf-arg-size (arg-type)
+  (ecase arg-type (:int 8) (:string +bt-comm-len+)))
+
 (defun lower-printf (args)
-  "Lower a bpftrace `printf(\"FMT\", arg1, …)` to a ringbuf-submit.
+  "Lower a bpftrace `printf(\"FMT\", arg…)` to a ringbuf-submit using
+   the unified async-action protocol.
 
-   Layout of each record:
-     offset 0:  u32 event-id  (index into the printf-table)
-     offset 4:  u32 nargs     (echoed for the userspace decoder's sanity)
-     offset 8+: u64 args …    (every arg widened to 64 bits)
+   Record layout (all little-endian):
+     0:  u32 tag = +bt-tag-printf+
+     4:  u32 id  (index into the printf-table)
+     8+: per-arg payloads — u64 for :int args, 16 bytes for :string
 
-   At codegen time we register (id . (fmt-string nargs)) in
+   At codegen time we register (id fmt-string arg-types) in
    *PRINTF-TABLE*, which the runtime gets via :printf-table in the
-   generate() plist. At runtime, a ring-consumer reads each record,
-   recovers the format string by ID, and printf-formats to stdout."
+   generate() plist. The runtime ring-consumer reads the tag, then
+   the id, then walks ARG-TYPES to decode each payload."
   (unless args
     (unsupported "printf() with no format string"))
   (let ((fmt (first args)))
     (unless (eq (first fmt) :str)
       (unsupported "printf() format must be a string literal"))
-    (let* ((fmt-str (second fmt))
+    (let* ((fmt-str    (second fmt))
            (extra-args (rest args))
-           (nargs (length extra-args))
-           (id (incf *printf-id-counter*))
-           (size (+ 8 (* 8 nargs)))
-           (rec (gensym "REC")))
-      (push (list id fmt-str nargs) *printf-table*)
-      `(whistler:with-ringbuf (,rec ,*print-map-name* ,size)
-         (whistler::store ,(intern "U32" :whistler) ,rec 0 ,id)
-         (whistler::store ,(intern "U32" :whistler) ,rec 4 ,nargs)
-         ,@(loop for a in extra-args
-                 for off from 8 by 8
-                 collect `(whistler::store ,(intern "U64" :whistler)
-                                           ,rec ,off ,(lower-expr a)))))))
+           (arg-types  (mapcar #'printf-arg-type extra-args))
+           (id         (incf *printf-id-counter*))
+           ;; Per-arg offsets — header (8) + cumulative arg sizes
+           (offsets    (let ((o 8))
+                         (loop for ty in arg-types
+                               collect o
+                               do (incf o (printf-arg-size ty)))))
+           (total-size (+ 8 (loop for ty in arg-types sum (printf-arg-size ty))))
+           (rec        (gensym "REC")))
+      (push (list id fmt-str arg-types) *printf-table*)
+      `(whistler:with-ringbuf (,rec ,*print-map-name* ,total-size)
+         (whistler::store ,(intern "U32" :whistler) ,rec 0 ,+bt-tag-printf+)
+         (whistler::store ,(intern "U32" :whistler) ,rec 4 ,id)
+         ,@(loop for arg in extra-args
+                 for ty  in arg-types
+                 for off in offsets
+                 collect (ecase ty
+                           (:int
+                            `(whistler::store ,(intern "U64" :whistler)
+                                              ,rec ,off ,(lower-expr arg)))
+                           (:string
+                            ;; `comm' is the only string source today.
+                            ;; bpf_get_current_comm(rec + off, 16) fills
+                            ;; the 16-byte slot directly.
+                            `(whistler::get-current-comm
+                              (+ ,rec ,off) ,+bt-comm-len+))))))))
 
 (defun lower-field (expr)
   (let ((base (getf (cdr expr) :base))
@@ -384,16 +502,28 @@
        (list (w-sym (concatenate 'string "tp-" name))))
       (t (unsupported "field access .~A on non-args expressions" name)))))
 
+(defun store-key-component (buf offset type expr)
+  "Emit the kernel form that fills (buf+offset, size-of-type) with EXPR's
+   value. `comm' uses bpf_get_current_comm; everything else is a plain
+   store of the lowered expression."
+  (if (eq (first expr) :comm)
+      `(whistler::get-current-comm (+ ,buf ,offset) ,+bt-comm-len+)
+      `(whistler::store ,type ,buf ,offset ,(lower-expr expr))))
+
 (defun with-key (keys body-fn)
-  "Run BODY-FN with the form to use as a map key. For scalar (zero or
-   one component) keys, BODY-FN gets the bare integer expression. For
-   composite keys, wraps the call in a let* that allocates a stack
-   buffer, stores each component at its layout offset, and passes the
-   buffer pointer symbol to BODY-FN. The map's declared :key-size (>8
-   for composites) triggers whistler's auto-dispatch to -ptr ops."
+  "Run BODY-FN with the form to use as a map key. For an empty key
+   list, BODY-FN gets 0. For a scalar 8-byte key, BODY-FN gets the
+   bare expression. For composite keys, or for any key whose layout
+   exceeds 8 bytes (e.g. a single `comm' key), wraps in a let* that
+   stack-allocates the key buffer, fills it, and passes the pointer
+   to BODY-FN. The map's declared :key-size > 8 then trips whistler's
+   struct-key-map-p test which auto-dispatches to -ptr map ops."
   (cond
-    ((null keys)         (funcall body-fn 0))
-    ((= (length keys) 1) (funcall body-fn (lower-expr (first keys))))
+    ((null keys)
+     (funcall body-fn 0))
+    ((and (= (length keys) 1)
+          (not (eq (first (first keys)) :comm)))
+     (funcall body-fn (lower-expr (first keys))))
     (t
      (multiple-value-bind (layout total) (composite-key-layout keys)
        (let ((k (gensym "K")))
@@ -401,8 +531,7 @@
                   (whistler::struct-alloc ,total)))
             ,@(loop for entry in layout
                     for (offset _size type expr) = entry
-                    collect `(whistler::store ,type ,k ,offset
-                                              ,(lower-expr expr)))
+                    collect (store-key-component k offset type expr))
             ,(funcall body-fn k)))))))
 
 (defun lower-key-form (keys)
@@ -500,6 +629,20 @@
            ((string= fn "count")
             (with-key keys
               (lambda (k) `(whistler:incf (whistler:getmap ,mname ,k)))))
+           ((string= fn "sum")
+            (gen-sum-update mname keys
+                            (lower-expr (first (getf (cdr rhs) :args)))))
+           ((string= fn "min")
+            (gen-min-max-update mname keys
+                                (lower-expr (first (getf (cdr rhs) :args)))
+                                :min))
+           ((string= fn "max")
+            (gen-min-max-update mname keys
+                                (lower-expr (first (getf (cdr rhs) :args)))
+                                :max))
+           ((string= fn "avg")
+            (gen-avg-update mname keys
+                            (lower-expr (first (getf (cdr rhs) :args)))))
            ((string= fn "hist")
             (when (rest keys)
               (unsupported "@m[k1,…] = hist(x) — per-key histograms not yet supported"))
@@ -508,6 +651,100 @@
             (unsupported "lhist() — Phase 1 ships hist() only"))
            (t (gen-scalar-set mname keys (lower-expr rhs) op)))))
       (t (gen-scalar-set mname keys (lower-expr rhs) op)))))
+
+(defun gen-sum-update (mname keys value-form)
+  "sum(x): incf the percpu-hash entry by x. The per-CPU storage means
+   each CPU has its own bucket — no atomics needed."
+  (with-key keys
+    (lambda (k)
+      `(whistler:incf (whistler:getmap ,mname ,k) ,value-form))))
+
+(defun keys-need-ptr-ops-p (keys)
+  "T iff the keys form requires the kernel -ptr map ops (whistler's
+   struct-key path). Triggered by composite keys or a single `comm'
+   key — both produce a stack buffer pointer rather than a u64."
+  (or (> (length keys) 1)
+      (and (= (length keys) 1)
+           (eq (first (first keys)) :comm))))
+
+(defun gen-percpu-struct-update (mname keys value-form &key on-existing on-init)
+  "Common scaffolding for sum/avg/min/max — all of which use a percpu
+   map with a struct value (16 bytes). The kernel side needs:
+     * map-lookup-ptr to find the per-CPU entry
+     * map-update-ptr to create one on first call
+   …and BOTH require pointer args, even when the user wrote a scalar
+   key like `@m[pid]`. We bind the lowered key into a let so its
+   stack slot has a stable address (`stack-addr`); the value-side is
+   already a struct-alloc'd pointer.
+
+   ON-EXISTING and ON-INIT each receive (p-symbol v-symbol init-symbol)
+   and return the body form for that branch."
+  (let* ((v    (gensym "V"))
+         (p    (gensym "P"))
+         (init (gensym "INIT"))
+         (ptr-p (keys-need-ptr-ops-p keys)))
+    (with-key keys
+      (lambda (k)
+        (let ((tmp-key (gensym "K")))
+          ;; For struct-key (already a pointer): use k directly.
+          ;; For scalar key: bind to a stack variable so stack-addr works.
+          (if ptr-p
+              `(let* ((,v ,value-form))
+                 (whistler:if-let (,p (whistler::map-lookup-ptr ,mname ,k))
+                   ,(funcall on-existing p v init)
+                   (let ((,init (whistler::struct-alloc 16)))
+                     ,(funcall on-init p v init)
+                     (whistler::map-update-ptr ,mname ,k ,init 0))))
+              `(let* ((,v ,value-form)
+                      (,tmp-key whistler::u64 ,k))
+                 (whistler:if-let
+                     (,p (whistler::map-lookup-ptr
+                          ,mname (whistler::stack-addr ,tmp-key)))
+                   ,(funcall on-existing p v init)
+                   (let ((,init (whistler::struct-alloc 16)))
+                     ,(funcall on-init p v init)
+                     (whistler::map-update-ptr
+                      ,mname (whistler::stack-addr ,tmp-key) ,init 0))))))))))
+
+(defun gen-min-max-update (mname keys value-form mode)
+  "min(x) / max(x): per-CPU 16-byte slot {value u64, is_set u64}."
+  (let ((cur (gensym "CUR")))
+    (gen-percpu-struct-update
+     mname keys value-form
+     :on-existing
+     (lambda (p v _init)
+       (declare (ignore _init))
+       `(let ((,cur (whistler::load whistler::u64 ,p 0))
+              (set  (whistler::load whistler::u64 ,p 8)))
+          (when (or (= set 0)
+                    ,(if (eq mode :min)
+                         `(< ,v ,cur)
+                         `(> ,v ,cur)))
+            (whistler::store whistler::u64 ,p 0 ,v)
+            (whistler::store whistler::u64 ,p 8 1))))
+     :on-init
+     (lambda (_p v init)
+       (declare (ignore _p))
+       `(progn
+          (whistler::store whistler::u64 ,init 0 ,v)
+          (whistler::store whistler::u64 ,init 8 1))))))
+
+(defun gen-avg-update (mname keys value-form)
+  "avg(x): per-CPU 16-byte slot {count u64, sum u64}."
+  (gen-percpu-struct-update
+   mname keys value-form
+   :on-existing
+   (lambda (p v _init)
+     (declare (ignore _init))
+     `(progn
+        (whistler::atomic-add ,p 0 1)
+        (whistler::atomic-add ,p 8 ,v)))
+   :on-init
+   (lambda (_p v init)
+     (declare (ignore _p))
+     `(progn
+        (whistler::store whistler::u64 ,init 0 1)
+        (whistler::store whistler::u64 ,init 8 ,v)))))
 
 (defun gen-scalar-set (mname keys value op)
   (with-key keys
@@ -551,20 +788,33 @@
               (mname (minfo-name info)))
          (with-key (getf (cdr arg) :keys)
            (lambda (k) `(whistler:remmap ,mname ,k)))))
-      ;; clear/zero/time are userspace-only — kernel side is a no-op.
-      ;; (exit and printf are intentionally NOT in this list so lower-call
-      ;; handles them: exit sets the bt-exit flag, printf becomes a
-      ;; bpf_trace_printk to /sys/kernel/tracing/trace_pipe.)
+      ;; zero() — kernel-side no-op; Phase 3 just skips it.
       ((and (consp e) (eq (first e) :call)
-            (member (getf (cdr e) :name)
-                    '("clear" "zero" "time")
-                    :test #'string=))
+            (string= (getf (cdr e) :name) "zero"))
        0)
+      ;; everything else — printf, exit, print, clear, time, ... —
+      ;; goes through lower-call, which emits the right ringbuf or
+      ;; flag-map op.
       (t (lower-expr e)))))
 
 ;;; ========== Probe lowering ==========
 
-(defparameter *kernel-spec-tags* '(:kprobe :kretprobe :tracepoint :begin :end))
+(defparameter *kernel-spec-tags*
+  '(:kprobe :kretprobe :tracepoint :begin :end :interval))
+
+(defun interval-period-ns (spec)
+  "Convert an :interval probe spec to a period in nanoseconds.
+   (:interval :unit :S :count 1)   → 1_000_000_000
+   (:interval :unit :MS :count 5)  → 5_000_000
+   (:interval :unit :US :count 50) → 50_000
+   (:interval :unit :HZ :count 99) → 1_000_000_000 / 99"
+  (let ((unit  (getf (cdr spec) :unit))
+        (count (getf (cdr spec) :count)))
+    (ecase unit
+      (:s  (* count 1000000000))
+      (:ms (* count 1000000))
+      (:us (* count 1000))
+      (:hz (floor 1000000000 count)))))
 
 (defun spec->section (spec)
   (ecase (first spec)
@@ -578,7 +828,12 @@
     (:begin      (values :kprobe (format nil "test_run/begin_~D"
                                          (incf *test-run-counter*))))
     (:end        (values :kprobe (format nil "test_run/end_~D"
-                                         (incf *test-run-counter*))))))
+                                         (incf *test-run-counter*))))
+    ;; interval probes attach to a periodic SOFTWARE/CPU_CLOCK perf
+    ;; event; the period (in ns) is encoded in the section name so the
+    ;; runtime can parse it back when wiring up the perf timer.
+    (:interval   (values :kprobe (format nil "interval/period_~D"
+                                         (interval-period-ns spec))))))
 
 (defvar *test-run-counter* 0
   "Per-generate() counter used to keep BEGIN/END section names unique.")
@@ -703,13 +958,16 @@
           (rest script))))
 
 (defun script-uses-printf-p (script)
-  "T iff the script calls printf() anywhere — used to decide whether
-   to inject the hidden bt-print ringbuf map."
+  "T iff the script calls any function that emits a bt-print record
+   (printf, print, clear, time) — gates injection of the bt-print
+   ringbuf map."
   (labels ((walk (form)
              (cond
                ((not (consp form)) nil)
                ((and (eq (first form) :call)
-                     (string= (getf (cdr form) :name) "printf"))
+                     (member (getf (cdr form) :name)
+                             '("printf" "print" "clear" "time")
+                             :test #'string=))
                 t)
                (t (some #'walk form)))))
     (some (lambda (probe) (walk (getf (cdr probe) :body)))
@@ -728,6 +986,7 @@
          (*test-run-counter* 0)
          (*printf-table* nil)
          (*printf-id-counter* 0)
+         (*map-id-table* nil)
          (map-table (infer-maps script))
          (*map-table* map-table)
          (maps      (loop for info being the hash-values of map-table
@@ -761,6 +1020,7 @@
           :exit-map (when uses-exit *exit-map-name*)
           :print-map (when uses-printf *print-map-name*)
           :printf-table (reverse *printf-table*)
+          :map-id-table (reverse *map-id-table*)
           :info (loop for raw being the hash-keys of map-table
                       using (hash-value info)
                       collect (list (or raw "@")

@@ -55,6 +55,12 @@
          (and (>= (length section-name) 10)
               (string= (subseq section-name 0 10) "uretprobe/")))
      +bpf-prog-type-kprobe+)
+    ;; interval — PERF_EVENT prog type so the kernel will SET_BPF on a
+    ;; PERF_TYPE_SOFTWARE / CPU_CLOCK event. Loaded with that prog
+    ;; type; the runtime attaches via attach-perf-timer.
+    ((and (>= (length section-name) 9)
+          (string= (subseq section-name 0 9) "interval/"))
+     +bpf-prog-type-perf-event+)
     ;; bpftrace BEGIN/END: RAW_TRACEPOINT programs invoked once from
     ;; userspace via BPF_PROG_TEST_RUN. (bpftrace itself does exactly
     ;; this; see attached_probe.cpp: case ProbeType::special → return
