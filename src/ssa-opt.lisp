@@ -367,14 +367,17 @@
       (dolist (insn (basic-block-insns block))
         (when (eq (ir-insn-op insn) :arg0)
           (setf ctx-vreg (ir-insn-dst insn)))))
-    ;; If ctx-vreg is passed as a direct argument to any helper call,
-    ;; it MUST be saved to R6 because helper calls clobber R1-R5.
+    ;; If ctx-vreg is passed as a direct argument to any helper call
+    ;; (or to tail-call / get-stackid, both of which call helpers with
+    ;; r1=ctx), it MUST be saved to R6 because helper calls clobber
+    ;; R1-R5. Otherwise the value in R1 is gone by the time the
+    ;; helper that needs it sees R1.
     (when ctx-vreg
       (dolist (block (ir-program-blocks prog))
         (dolist (insn (basic-block-insns block))
-          (when (eq (ir-insn-op insn) :call)
-            ;; Check if ctx-vreg is among the call arguments
-            ;; Args format: ((:helper N) arg1 arg2 ...) — skip the helper id
+          (when (member (ir-insn-op insn) '(:call :tail-call :get-stackid))
+            ;; All three argument layouts include ctx-vreg somewhere
+            ;; in the list of args (after a leading :helper/:map tag).
             (dolist (arg (rest (ir-insn-args insn)))
               (when (and (integerp arg) (eql arg ctx-vreg))
                 (return-from ctx-loads-early-p nil)))))))

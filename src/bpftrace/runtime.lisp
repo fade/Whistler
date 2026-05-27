@@ -121,6 +121,10 @@
       (values (subseq tail 0 last-colon)
               (subseq tail (1+ last-colon))))))
 
+(defvar *session-symbolizer* nil
+  "Dynamically bound by RUN-GENERATED while a session is up. Used by
+   the printer to symbolise ustack frames.")
+
 (defun attach-probe (prog-info)
   "Inspect the program's section name and call the appropriate attach-*.
    Translates BPF errors into BPFTRACE-ATTACH-ERROR with hints."
@@ -339,12 +343,35 @@
                           (t (max cur v)))))))
     (or cur 0)))
 
+(defun composite-slot (key index)
+  "Extract the INDEX'th u64 slot from a composite key bignum."
+  (logand (ash key (* index -64)) #xffffffffffffffff))
+
+(defun composite-stack-info (key-types)
+  "Inspect KEY-TYPES (per-slot hints for a composite key) and return
+   (values STACK-SLOT PID-SLOT USER-P) — the indices of the stack-id
+   and the pid slot, plus whether it's a user stack. Returns NIL if
+   the composite doesn't contain a stack."
+  (let ((stack-idx nil)
+        (pid-idx   nil)
+        (user-p    nil))
+    (loop for ty in key-types
+          for i from 0
+          do (case ty
+               (:kstack (setf stack-idx i))
+               (:ustack (setf stack-idx i user-p t))
+               ((:pid :tid) (unless pid-idx (setf pid-idx i)))))
+    (when stack-idx (values stack-idx pid-idx user-p))))
+
 (defun print-scalar-map (label info &key (key-parts 1) keyed-p
                                           (kind :counter) key-builtin
-                                          stacks-info stack-depth)
+                                          key-types
+                                          stacks-info stack-depth
+                                          symbolizer)
   "Print a hash or percpu-hash map's contents in bpftrace's END-dump
-   style. KIND controls value decoding; KEY-BUILTIN is the key shape
-   hint (:comm → ASCII; :kstack → multi-line symbolised stack)."
+   style. KIND controls value decoding; KEY-BUILTIN is the single-slot
+   key shape hint; KEY-TYPES is the per-slot hint list for composite
+   keys (e.g. (:pid :ustack)). SYMBOLIZER resolves ustack IPs."
   (let* ((keys (map-keys info))
          (pairs (sort (mapcar
                        (lambda (k)
@@ -359,29 +386,46 @@
                        keys)
                       #'< :key #'cdr))
          (prefix (if (or (null label) (string= label "@")) "@" (format nil "@~A" label))))
-    (cond
-      ;; Stack keys render as a multi-line block — symbolised for
-      ;; kstack, hex for ustack (per-process maps not yet wired up).
-      ((or (eq key-builtin :kstack) (eq key-builtin :ustack))
-       (dolist (kv pairs)
-         (format t "~A[~%~A~%]: ~D~%"
-                 prefix
-                 (format-stack (car kv) stacks-info (or stack-depth 32)
-                               :user-p (eq key-builtin :ustack))
-                 (cdr kv))))
-      (keyed-p
-       (dolist (kv pairs)
-         (format t "~A[~A]: ~D~%"
-                 prefix
-                 (format-key (car kv)
-                             :parts key-parts
-                             :key-builtin key-builtin)
-                 (cdr kv))))
-      (t
-       (dolist (kv pairs)
-         (format t "~A: ~D~%" prefix (cdr kv)))))))
+    (multiple-value-bind (stack-idx pid-idx user-p)
+        (when key-types (composite-stack-info key-types))
+      (cond
+        ;; Composite key with a stack slot (kstack or ustack).
+        (stack-idx
+         (dolist (kv pairs)
+           (let* ((k (car kv))
+                  (stack-id (composite-slot k stack-idx))
+                  (pid      (and pid-idx (composite-slot k pid-idx))))
+             (format t "~A[~%~A~%]: ~D~%"
+                     prefix
+                     (format-stack stack-id stacks-info
+                                   (or stack-depth 32)
+                                   :user-p user-p
+                                   :pid pid
+                                   :symbolizer symbolizer)
+                     (cdr kv)))))
+        ;; Single-slot stack key (e.g. profile:hz:99 { @[kstack]++ }).
+        ((or (eq key-builtin :kstack) (eq key-builtin :ustack))
+         (dolist (kv pairs)
+           (format t "~A[~%~A~%]: ~D~%"
+                   prefix
+                   (format-stack (car kv) stacks-info (or stack-depth 32)
+                                 :user-p (eq key-builtin :ustack)
+                                 :symbolizer symbolizer)
+                   (cdr kv))))
+        (keyed-p
+         (dolist (kv pairs)
+           (format t "~A[~A]: ~D~%"
+                   prefix
+                   (format-key (car kv)
+                               :parts key-parts
+                               :key-builtin key-builtin)
+                   (cdr kv))))
+        (t
+         (dolist (kv pairs)
+           (format t "~A: ~D~%" prefix (cdr kv))))))))
 
-(defun print-all-maps (info-list map-alist &key stacks-info stack-depth)
+(defun print-all-maps (info-list map-alist &key stacks-info stack-depth
+                                                symbolizer)
   "Dump every known map in bpftrace END style."
   (dolist (info-rec info-list)
     (let* ((raw-name    (first info-rec))
@@ -399,9 +443,11 @@
                                    :key-parts key-parts
                                    :keyed-p (getf (cdr info-rec) :keyed-p)
                                    :key-builtin (getf (cdr info-rec) :key-builtin)
+                                   :key-types (getf (cdr info-rec) :key-types)
                                    :kind kind
                                    :stacks-info stacks-info
-                                   :stack-depth stack-depth)))))))
+                                   :stack-depth stack-depth
+                                   :symbolizer symbolizer)))))))
 
 ;;; ========== Userspace BEGIN/END ==========
 
@@ -480,12 +526,32 @@
            (cell (assoc (- neg) *errno-names*)))
       (or (cdr cell) (format nil "-~D" (- neg))))))
 
-(defun format-stack (stack-id stacks-info depth &key user-p)
+(defun format-user-frame (ip pid symbolizer)
+  "Symbolise a userspace IP against the given PID's maps. Falls back
+   to bare hex if SYMBOLIZER is NIL, PID is NIL, or the lookup fails."
+  (cond
+    ((or (null symbolizer) (null pid) (zerop pid))
+     (format nil "0x~16,'0X" ip))
+    (t
+     (let* ((s (whistler/symbolize:symbolize symbolizer pid ip))
+            (name (whistler/symbolize:sym-name s)))
+       (cond
+         (name
+          (let ((file (whistler/symbolize:sym-file s)))
+            (format nil "~A+0x~X~@[ [~A]~]"
+                    name
+                    (whistler/symbolize:sym-offset s)
+                    (and file (file-namestring file)))))
+         (t
+          (format nil "0x~16,'0X~@[ [~A]~]"
+                  ip
+                  (let ((f (whistler/symbolize:sym-file s)))
+                    (and f (file-namestring f))))))))))
+
+(defun format-stack (stack-id stacks-info depth &key user-p pid symbolizer)
   "Render a kstack/ustack key as bpftrace's indented multi-line stack.
    Kernel stacks resolve against /proc/kallsyms; userspace stacks
-   need per-process /proc/<pid>/maps for proper symbolisation (not
-   yet wired up — addresses render as hex, and `@[pid, ustack]'
-   composite keys are the path to real names later)."
+   resolve via SYMBOLIZER against the given PID's /proc/<pid>/maps."
   (with-output-to-string (s)
     (let ((errname (stackid-errno stack-id)))
       (if errname
@@ -497,7 +563,7 @@
                       do (unless first-p (terpri s))
                          (format s "        ~A"
                                  (if user-p
-                                     (format nil "0x~16,'0X" ip)
+                                     (format-user-frame ip pid symbolizer)
                                      (resolve-symbol ip))))
                 (format s "        <stack id ~D unavailable>" stack-id)))))))
 
@@ -606,9 +672,11 @@
                   :key-parts (or (getf (cdr info-rec) :key-parts) 1)
                   :keyed-p   (getf (cdr info-rec) :keyed-p)
                   :key-builtin (getf (cdr info-rec) :key-builtin)
+                  :key-types (getf (cdr info-rec) :key-types)
                   :kind      (getf (cdr info-rec) :kind)
                   :stacks-info stacks-info
-                  :stack-depth stack-depth)))))))
+                  :stack-depth stack-depth
+                  :symbolizer *session-symbolizer*)))))))
 
 (defun decode-clear-map-record (sap map-id-table map-alist)
   (let ((id (sap-read-u32-le sap 4)))
@@ -678,6 +746,12 @@
            (print-info (find-print-map gen map-alist))
            (stacks-info (find-stacks-map gen map-alist))
            (stack-depth (or (getf gen :stack-depth) 32))
+           ;; Userspace symboliser for ustack frames. Allocated once
+           ;; per session; per-pid /proc/<pid>/maps snapshots happen
+           ;; lazily on first lookup. We pre-snapshot for uprobe
+           ;; targets in attach-probe so short-lived processes still
+           ;; resolve after they exit.
+           (symbolizer (whistler/symbolize:open-symbolizer))
            (printf-table (getf gen :printf-table))
            (map-id-table (getf gen :map-id-table))
            (info-list-cached info-list)
@@ -704,52 +778,55 @@
                             (test-run-section-p
                              (whistler/loader::prog-info-section-name (cdr entry))))
                           prog-alist)))
-      (unwind-protect
-           (handler-case
-               (progn
-                 ;; BEGIN — kernel test_run, before any attaches.
-                 (dolist (b begin-progs)
-                   (whistler/loader::prog-test-run
-                    (whistler/loader::prog-info-fd (cdr b))))
-                 ;; Drain anything BEGIN already wrote to the ringbuf
-                 ;; so its output prints before the main loop starts.
-                 (when ring-consumer
-                   (whistler/loader::ring-poll ring-consumer :timeout-ms 0))
-                 ;; Attach all real probes.
-                 (dolist (entry attach-progs)
-                   (push (attach-probe (cdr entry)) atts))
-                 ;; Poll-sleep until interrupted or exit() fires.
-                 ;; Drain the printf ringbuf on every tick.
-                 (setf *bpftrace-running* t)
-                 (handler-case
-                     (loop while (and *bpftrace-running*
-                                      (not (exit-flag-set-p exit-info)))
-                           do (if ring-consumer
-                                  (whistler/loader::ring-poll
-                                   ring-consumer :timeout-ms 100)
-                                  (sleep 0.1)))
-                   (sb-sys:interactive-interrupt ()
-                     (format t "~&^C~%"))))
-             (bpftrace-attach-error (e)
-               (format *error-output* "~&~A~%" e)))
-        ;; END — kernel test_run, then drain any final printf output,
-        ;; then dump maps.
-        (dolist (e end-progs)
-          (handler-case
-              (whistler/loader::prog-test-run
-               (whistler/loader::prog-info-fd (cdr e)))
-            (error () nil)))
-        (when ring-consumer
-          (whistler/loader::ring-poll ring-consumer :timeout-ms 0))
-        (print-all-maps info-list map-alist
-                        :stacks-info stacks-info
-                        :stack-depth stack-depth)
-        (dolist (a atts) (handler-case (whistler/loader::detach a) (error () nil)))
-        (dolist (e prog-alist)
-          (let ((fd (whistler/loader::prog-info-fd (cdr e))))
-            (when (plusp fd)
-              (handler-case (sb-posix:close fd) (error () nil)))))
-        (dolist (e map-alist)
-          (let ((fd (whistler/loader::map-info-fd (cdr e))))
-            (when (plusp fd)
-              (handler-case (sb-posix:close fd) (error () nil)))))))))
+      (let ((*session-symbolizer* symbolizer))
+        (unwind-protect
+             (handler-case
+                 (progn
+                   ;; BEGIN — kernel test_run, before any attaches.
+                   (dolist (b begin-progs)
+                     (whistler/loader::prog-test-run
+                      (whistler/loader::prog-info-fd (cdr b))))
+                   ;; Drain anything BEGIN already wrote to the ringbuf
+                   ;; so its output prints before the main loop starts.
+                   (when ring-consumer
+                     (whistler/loader::ring-poll ring-consumer :timeout-ms 0))
+                   ;; Attach all real probes.
+                   (dolist (entry attach-progs)
+                     (push (attach-probe (cdr entry)) atts))
+                   ;; Poll-sleep until interrupted or exit() fires.
+                   ;; Drain the printf ringbuf on every tick.
+                   (setf *bpftrace-running* t)
+                   (handler-case
+                       (loop while (and *bpftrace-running*
+                                        (not (exit-flag-set-p exit-info)))
+                             do (if ring-consumer
+                                    (whistler/loader::ring-poll
+                                     ring-consumer :timeout-ms 100)
+                                    (sleep 0.1)))
+                     (sb-sys:interactive-interrupt ()
+                       (format t "~&^C~%"))))
+               (bpftrace-attach-error (e)
+                 (format *error-output* "~&~A~%" e)))
+          ;; END — kernel test_run, then drain final printf output,
+          ;; then dump maps.
+          (dolist (e end-progs)
+            (handler-case
+                (whistler/loader::prog-test-run
+                 (whistler/loader::prog-info-fd (cdr e)))
+              (error () nil)))
+          (when ring-consumer
+            (whistler/loader::ring-poll ring-consumer :timeout-ms 0))
+          (print-all-maps info-list map-alist
+                          :stacks-info stacks-info
+                          :stack-depth stack-depth
+                          :symbolizer symbolizer)
+          (whistler/symbolize:close-symbolizer symbolizer)
+          (dolist (a atts) (handler-case (whistler/loader::detach a) (error () nil)))
+          (dolist (e prog-alist)
+            (let ((fd (whistler/loader::prog-info-fd (cdr e))))
+              (when (plusp fd)
+                (handler-case (sb-posix:close fd) (error () nil)))))
+          (dolist (e map-alist)
+            (let ((fd (whistler/loader::map-info-fd (cdr e))))
+              (when (plusp fd)
+                (handler-case (sb-posix:close fd) (error () nil))))))))))

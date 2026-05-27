@@ -73,7 +73,7 @@
   :version "0.1.0"
   :author "Anthony Green <green@moxielogic.com>"
   :license "MIT"
-  :depends-on ("whistler" "whistler/loader" "iparse")
+  :depends-on ("whistler" "whistler/loader" "whistler/symbolize" "iparse")
   :serial t
   :pathname "src/bpftrace/"
   :components ((:file "packages")

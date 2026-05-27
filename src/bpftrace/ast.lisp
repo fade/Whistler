@@ -103,9 +103,48 @@
 ;;; ========== Main entry ==========
 
 (defun normalize (raw)
-  "Convert the iparse parse tree RAW into the typed AST."
+  "Convert the iparse parse tree RAW into the typed AST, then apply
+   post-parse rewrites (auto-prepend pid to ustack-keyed maps)."
   (assert (eq (tag-of raw) :script) (raw) "expected :SCRIPT root, got ~S" (tag-of raw))
-  (cons :script (mapcar #'norm-probe (all-tagged raw :probe))))
+  (rewrite-ustack-pids
+   (cons :script (mapcar #'norm-probe (all-tagged raw :probe)))))
+
+;;; ========== Post-parse: auto-prepend pid to ustack keys ==========
+;;;
+;;; bpftrace's `@[ustack]++' is only useful when paired with a pid —
+;;; symbolisation needs to know which process produced the stack, and
+;;; in a multi-pid system different processes have different memory
+;;; maps. We silently rewrite any @-map access whose :keys contain
+;;; :ustack without :pid/:tid into @[pid, …]: the user gets per-process
+;;; symbolised output without having to remember the convention.
+
+(defun ustack-key-p (k) (and (consp k) (eq (first k) :ustack)))
+(defun pid-or-tid-key-p (k)
+  (and (consp k) (eq (first k) :builtin)
+       (member (second k) '(:pid :tid))))
+
+(defun rewrite-map-keys (keys)
+  "If KEYS contain :ustack and don't already include :pid/:tid,
+   prepend (:builtin :pid). Otherwise return as-is."
+  (if (and (some #'ustack-key-p keys)
+           (not (some #'pid-or-tid-key-p keys)))
+      (cons '(:builtin :pid) keys)
+      keys))
+
+(defun rewrite-ustack-pids (form)
+  "Walk FORM recursively; for every :map node with naked :ustack
+   keys, auto-prepend (:builtin :pid)."
+  (cond
+    ((not (consp form)) form)
+    ((eq (first form) :map)
+     (let ((new-keys (rewrite-map-keys (getf (cdr form) :keys))))
+       (list* :map
+              :name (getf (cdr form) :name)
+              :keys (mapcar #'rewrite-ustack-pids new-keys)
+              (loop for (k v) on (cdr form) by #'cddr
+                    unless (member k '(:name :keys))
+                      append (list k v)))))
+    (t (mapcar #'rewrite-ustack-pids form))))
 
 ;;; ========== Probes ==========
 

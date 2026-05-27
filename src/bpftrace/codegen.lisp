@@ -33,6 +33,9 @@
   value-size       ; bytes
   max-entries
   key-builtin      ; hint for printing; :pid / :arg / NIL
+  key-types        ; for composite keys: list of one keyword per slot
+                   ;   (e.g. (:pid :ustack) for @[pid, ustack]).
+                   ;   NIL for scalar single-slot keys.
   keyed-p)         ; T iff any access used [keys]. Scalar-only `@m =`
                    ;   maps stay NIL so the printer skips the `[…]`.
 
@@ -178,9 +181,17 @@
                                  total))))
                      (setf (minfo-key-size info)
                            (max (minfo-key-size info) total)))
+                   ;; Single-key: store the hint so the printer renders
+                   ;; comm as ASCII, pid as bare decimal, etc.
                    (when (and (null (minfo-key-builtin info))
                               (= (length keys) 1))
-                     (setf (minfo-key-builtin info) (key-hint (first keys)))))))
+                     (setf (minfo-key-builtin info) (key-hint (first keys))))
+                   ;; Composite: track per-slot hints so the printer
+                   ;; can dispatch on individual slots.
+                   (when (and (null (minfo-key-types info))
+                              (> (length keys) 1))
+                     (setf (minfo-key-types info)
+                           (mapcar #'key-hint keys))))))
              (note-rhs (mref rhs)
                (let ((info (ensure mref)))
                  (cond
@@ -1083,6 +1094,7 @@
                                     :name (minfo-name info)
                                     :kind (minfo-kind info)
                                     :key-builtin (minfo-key-builtin info)
+                                    :key-types (minfo-key-types info)
                                     :key-size (minfo-key-size info)
                                     :key-parts (if (> (minfo-key-size info) 8)
                                                    (/ (minfo-key-size info) 8)
