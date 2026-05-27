@@ -306,7 +306,10 @@
   <ident-char>   = #'[A-Za-z0-9_]'
   string-lit     = #'\"([^\"\\\\]|\\\\.)*\"'
   hex-int        = #'0[xX][0-9A-Fa-f]+'
-  integer        = #'[0-9]+'
+  (* bpftrace accepts shorthand scientific notation as an integer
+     literal: \`1e6' → 1000000. We restrict to non-negative exponents
+     so the result stays an integer. *)
+  integer        = #'[0-9]+([eE][0-9]+)?'
   <ws>           = #'[\\s]*'
   ")
 

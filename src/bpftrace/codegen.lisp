@@ -695,6 +695,12 @@
       ((string= name "reg")    (lower-reg-call (getf (cdr expr) :args)))
       ((string= name "kaddr")  (lower-kaddr-call (getf (cdr expr) :args)))
       ((string= name "has_key") (lower-has-key-call (getf (cdr expr) :args)))
+      ;; `getopt(NAME, DEFAULT, HELP)' — bpftrace's CLI-flag accessor.
+      ;; whistler bpftrace doesn't expose user options, so this always
+      ;; returns the default value (the second argument).
+      ((string= name "getopt")
+       (lower-expr (or (second (getf (cdr expr) :args))
+                       '(:int 0))))
       ;; User-defined `fn' — inline the body, substituting the
       ;; formal parameters with the actual argument expressions.
       ((find-user-function name)

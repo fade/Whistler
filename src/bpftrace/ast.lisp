@@ -447,8 +447,16 @@
                            (text-of (first-tagged inner :ident))))
       (:string-lit   (list :str (strip-quotes (text-of inner))))
       (:hex-int      (list :int (parse-integer (text-of inner) :start 2 :radix 16)))
-      (:integer      (list :int (parse-integer (text-of inner))))
+      (:integer      (list :int (parse-integer-with-exp (text-of inner))))
       (t (error "unexpected primary: ~S" inner)))))
+
+(defun parse-integer-with-exp (s)
+  "Parse \"NNNN\" or \"NNNNeMM\" as an integer (mantissa × 10^MM)."
+  (let ((e (or (position #\e s) (position #\E s))))
+    (if e
+        (* (parse-integer s :end e)
+           (expt 10 (parse-integer s :start (1+ e))))
+        (parse-integer s))))
 
 (defun strip-quotes (s)
   ;; remove surrounding ""s and decode \n \t \\ \" — minimal
