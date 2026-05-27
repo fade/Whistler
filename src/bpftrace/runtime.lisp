@@ -869,7 +869,7 @@
     (let ((end (or (position 0 bytes) max-len)))
       (sb-ext:octets-to-string bytes :end end :external-format :utf-8))))
 
-(defun decode-printf-record (sap printf-table)
+(defun decode-printf-record (sap printf-table &optional time-format-table)
   "Pop a tag=0 (printf) record off the ringbuf and write its formatted
    text to stdout. SAP points at the start of the record; the u32 tag
    has already been read."
@@ -881,6 +881,17 @@
              (args  (let ((off 8))
                       (loop for ty in types
                             collect (cond
+                                      ((and (consp ty) (eq (car ty) :strftime))
+                                       (let* ((ts (sap-read-u64-le sap off))
+                                              (fmt-id (cdr ty))
+                                              (fstr (cdr (assoc fmt-id
+                                                                time-format-table
+                                                                :test #'=))))
+                                         (declare (ignore ts))
+                                         (incf off 8)
+                                         (if fstr
+                                             (strftime-light fstr)
+                                             "?")))
                                       ((eq ty :int)
                                        (prog1 (sap-read-u64-le sap off)
                                          (incf off 8)))
@@ -1062,7 +1073,7 @@
     (declare (ignore len))
     (let ((tag (sap-read-u32-le sap 0)))
       (case tag
-        (0 (decode-printf-record    sap printf-table))
+        (0 (decode-printf-record    sap printf-table time-format-table))
         (1 (decode-print-map-record sap map-id-table map-alist info-list
                                     stacks-info stack-depth))
         (2 (decode-clear-map-record sap map-id-table map-alist))

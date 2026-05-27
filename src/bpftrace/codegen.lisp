@@ -482,29 +482,67 @@
            (unsupported "kretfunc:~A — function not found in vmlinux BTF" fname))
          `(whistler::ctx ,(intern "U64" :whistler) ,(* nargs 8)))))))
 
+(defun comm-string-comparison (op raw-lhs raw-rhs)
+  "Handle `comm == \"literal\"' / `comm != \"literal\"' as a byte-by-byte
+   compare against a get_current_comm buffer. Returns the lowered form
+   or NIL if the operands don't match the pattern."
+  (let ((lit (cond ((and (consp raw-lhs) (eq (first raw-lhs) :comm)
+                         (consp raw-rhs) (eq (first raw-rhs) :str))
+                    (second raw-rhs))
+                   ((and (consp raw-rhs) (eq (first raw-rhs) :comm)
+                         (consp raw-lhs) (eq (first raw-lhs) :str))
+                    (second raw-lhs)))))
+    (when lit
+      (let* ((bytes (sb-ext:string-to-octets lit :external-format :utf-8))
+             (n     (length bytes))
+             (buf   (gensym "CMBUF"))
+             ;; Compare each byte of the literal plus a NUL terminator
+             ;; (so "bash" doesn't spuriously match "bashish").
+             (clauses
+               (loop for i from 0 below (min n +bt-comm-len+)
+                     collect `(whistler::= (whistler::load
+                                            ,(intern "U8" :whistler)
+                                            ,buf ,i)
+                                           ,(aref bytes i))))
+             (nul-check
+               (when (< n +bt-comm-len+)
+                 `(whistler::= (whistler::load ,(intern "U8" :whistler)
+                                               ,buf ,n)
+                               0)))
+             (all-eq `(whistler::and ,@clauses ,@(and nul-check (list nul-check)))))
+        `(let ((,buf (whistler::struct-alloc ,+bt-comm-len+)))
+           (whistler::get-current-comm ,buf ,+bt-comm-len+)
+           ,(if (eq op :!=) `(whistler::not ,all-eq) all-eq))))))
+
 (defun lower-bin (expr)
-  (let ((op  (getf (cdr expr) :op))
-        (lhs (lower-expr (getf (cdr expr) :lhs)))
-        (rhs (lower-expr (getf (cdr expr) :rhs))))
-    (ecase op
-      (:+    `(whistler::+ ,lhs ,rhs))
-      (:-    `(whistler::- ,lhs ,rhs))
-      (:*    `(whistler::* ,lhs ,rhs))
-      (:/    `(whistler::/ ,lhs ,rhs))
-      (:%    `(whistler::mod ,lhs ,rhs))
-      (:==   `(whistler::= ,lhs ,rhs))
-      (:!=   `(whistler::/= ,lhs ,rhs))
-      (:<    `(whistler::< ,lhs ,rhs))
-      (:>    `(whistler::> ,lhs ,rhs))
-      (:<=   `(whistler::<= ,lhs ,rhs))
-      (:>=   `(whistler::>= ,lhs ,rhs))
-      (:&&   `(whistler::and ,lhs ,rhs))
-      (:\|\| `(whistler::or ,lhs ,rhs))
-      (:&    `(whistler::logand ,lhs ,rhs))
-      (:\|   `(whistler::logior ,lhs ,rhs))
-      (:^    `(whistler::logxor ,lhs ,rhs))
-      (:<<   `(whistler::ash ,lhs ,rhs))
-      (:>>   `(whistler::>> ,lhs ,rhs)))))
+  (let* ((op  (getf (cdr expr) :op))
+         (raw-lhs (getf (cdr expr) :lhs))
+         (raw-rhs (getf (cdr expr) :rhs)))
+    ;; Special case: comm == / != "literal".
+    (when (member op '(:== :!=))
+      (let ((cmp (comm-string-comparison op raw-lhs raw-rhs)))
+        (when cmp (return-from lower-bin cmp))))
+    (let ((lhs (lower-expr raw-lhs))
+          (rhs (lower-expr raw-rhs)))
+      (ecase op
+        (:+    `(whistler::+ ,lhs ,rhs))
+        (:-    `(whistler::- ,lhs ,rhs))
+        (:*    `(whistler::* ,lhs ,rhs))
+        (:/    `(whistler::/ ,lhs ,rhs))
+        (:%    `(whistler::mod ,lhs ,rhs))
+        (:==   `(whistler::= ,lhs ,rhs))
+        (:!=   `(whistler::/= ,lhs ,rhs))
+        (:<    `(whistler::< ,lhs ,rhs))
+        (:>    `(whistler::> ,lhs ,rhs))
+        (:<=   `(whistler::<= ,lhs ,rhs))
+        (:>=   `(whistler::>= ,lhs ,rhs))
+        (:&&   `(whistler::and ,lhs ,rhs))
+        (:\|\| `(whistler::or ,lhs ,rhs))
+        (:&    `(whistler::logand ,lhs ,rhs))
+        (:\|   `(whistler::logior ,lhs ,rhs))
+        (:^    `(whistler::logxor ,lhs ,rhs))
+        (:<<   `(whistler::ash ,lhs ,rhs))
+        (:>>   `(whistler::>> ,lhs ,rhs))))))
 
 (defun lower-un (expr)
   (let ((op  (getf (cdr expr) :op))
@@ -739,6 +777,19 @@
     ((named-call-p expr "ksym") :ksym)
     ((named-call-p expr "usym") :usym)
     ((named-call-p expr "ntop") (ntop-arg-type expr))
+    ((named-call-p expr "strftime")
+     ;; Register the format string and emit a (:strftime . ID) slot.
+     ;; The wire format is just the u64 timestamp; the runtime looks
+     ;; up FMT by id at print time, like time(FMT).
+     (let* ((args (getf (cdr expr) :args))
+            (fmt  (and args
+                       (eq (first (first args)) :str)
+                       (second (first args))))
+            (id   (1+ (length *time-format-table*))))
+       (unless fmt
+         (unsupported "strftime() format arg must be a string literal"))
+       (push (cons id fmt) *time-format-table*)
+       (cons :strftime id)))
     (t :int)))
 
 (defun ntop-arg-type (expr)
@@ -765,7 +816,8 @@
     ((eq arg-type :usym) 16)
     ((eq arg-type :ipv4) 4)
     ((eq arg-type :ipv6) 16)
-    ((and (consp arg-type) (eq (car arg-type) :string)) (cdr arg-type))
+    ((and (consp arg-type) (eq (car arg-type) :string))   (cdr arg-type))
+    ((and (consp arg-type) (eq (car arg-type) :strftime)) 8)  ; just the u64 timestamp
     (t (error "printf-arg-size: unrecognised ~A" arg-type))))
 
 (defun lower-printf (args)
@@ -831,6 +883,12 @@
      (let* ((args (getf (cdr arg) :args))
             (addr-expr (lower-expr (if (cdr args) (second args) (first args)))))
        `(whistler::store ,(intern "U32" :whistler) ,rec ,off ,addr-expr)))
+    ((and (consp ty) (eq (car ty) :strftime))
+     ;; Store the timestamp as a u64; the format-id is implicit in
+     ;; the printf-table's per-arg type list.
+     (let* ((args (getf (cdr arg) :args))
+            (ts-expr (lower-expr (second args))))
+       `(whistler::store ,(intern "U64" :whistler) ,rec ,off ,ts-expr)))
     ((eq ty :ipv6)
      ;; 16 bytes copied from a pointer in user/kernel memory.
      (let* ((args (getf (cdr arg) :args))
@@ -1048,12 +1106,13 @@
 
 (defun lower-stmt (stmt)
   (ecase (first stmt)
-    (:if      (lower-if stmt))
-    (:while   (lower-while stmt))
-    (:assign  (lower-assign stmt))
-    (:incdec  (lower-incdec stmt))
-    (:expr    (lower-expr-stmt stmt))
-    (:return  (unsupported "return outside fn body"))))
+    (:if        (lower-if stmt))
+    (:while     (lower-while stmt))
+    (:assign    (lower-assign stmt))
+    (:incdec    (lower-incdec stmt))
+    (:expr      (lower-expr-stmt stmt))
+    (:let-noop  0)  ; bare `let $x;' — declaration, no work to do
+    (:return    (unsupported "return outside fn body"))))
 
 (defun lower-while (stmt)
   "Lower a bpftrace `while (cond) { body }' to a bounded dotimes:

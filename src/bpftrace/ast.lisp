@@ -240,6 +240,21 @@
               (cond-expr (norm-expr-or-expr-wrapped (first kids)))
               (body      (norm-block (second kids))))
          (list :while :cond cond-expr :body body)))
+      (:let-stmt
+       ;; let $x;          → no-op (drop)
+       ;; let $x = expr;   → (:assign (:var "x") := expr)
+       (let* ((ident-node (first-tagged inner :ident))
+              (name       (text-of ident-node))
+              (rhs        (find-if (lambda (c)
+                                     (and (consp c)
+                                          (not (eq (tag-of c) :ident))))
+                                   (children-of inner))))
+         (cond
+           (rhs (list :assign
+                      :lhs (list :var name)
+                      :op  :=
+                      :rhs (norm-expr-or-expr-wrapped rhs)))
+           (t (list :let-noop)))))
       (:return-stmt
        (let ((expr-node (find-if (lambda (c) (and (consp c)
                                                   (not (eq (tag-of c) :ident))))

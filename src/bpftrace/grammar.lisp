@@ -212,9 +212,13 @@
 
   block          = <'{'> <ws> statements? <ws> <'}'>
   statements     = statement (<ws> <';'> <ws> statement)* (<ws> <';'>)?
-  statement      = if-stmt / while-stmt / return-stmt / assign-stmt / expr-stmt
+  statement      = if-stmt / while-stmt / let-stmt / return-stmt / assign-stmt / expr-stmt
   return-stmt    = <'return'> !ident-char <ws> expr?
   while-stmt     = <'while'> !ident-char <ws> <'('> <ws> expr <ws> <')'> <ws> block
+  (* `let $var;' or `let $var = expr;' — bpftrace's local-var decl.
+     For us the bare decl is a no-op (variables are inferred from
+     use); the assigning form becomes a regular :assign. *)
+  let-stmt       = <'let'> !ident-char <ws> <'$'> ident (<ws> <'='> <ws> expr)?
   if-stmt        = <'if'> <ws> <'('> <ws> expr <ws> <')'> <ws> block (<ws> <'else'> <ws> block)?
   assign-stmt    = lhs <ws> assign-op <ws> expr  /
                    lhs <ws> incdec-op
