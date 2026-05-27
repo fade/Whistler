@@ -1023,22 +1023,25 @@
          ;; bpftrace doesn't either; if the user wants only the child's
          ;; pid they pass both -c and -p.
          (child-process (when cmd-arg (spawn-traced-process cmd-arg)))
-         ;; bpftrace's PidFilterPass only injects the predicate when
-         ;; -p is set (it consults bpftrace_.pid() which is nullopt
-         ;; for -c). For -c the trace is intentionally system-wide
-         ;; during the child's lifetime, because the child often
-         ;; spawns subprocesses with different pids.
+         ;; bpftrace doesn't pid-filter for -c (their PidFilterPass
+         ;; returns nullopt when -c is set), but since we exec the
+         ;; binary directly without a shell wrapper, the child pid IS
+         ;; the user's target. Filtering produces noticeably cleaner
+         ;; output. If a user wants system-wide instead, they can
+         ;; combine -e with a manual background-spawn.
+         (effective-pid (or pid-arg
+                            (and child-process (traced-child-pid child-process))))
          (filter-var  (find-symbol "*PID-FILTER*"    '#:whistler/bpftrace))
          (child-var   (find-symbol "*CHILD-PROCESS*" '#:whistler/bpftrace))
          (hook-var    (find-symbol "*POST-ATTACH-HOOK*" '#:whistler/bpftrace))
          (release-thunk (when child-process
                           (lambda () (release-traced-process child-process)))))
-    (progv (remove nil (list (when pid-arg     filter-var)
-                              (when child-process child-var)
-                              (when release-thunk hook-var)))
-           (remove nil (list (when pid-arg     pid-arg)
-                              (when child-process child-process)
-                              (when release-thunk release-thunk)))
+    (progv (remove nil (list (when effective-pid filter-var)
+                              (when child-process    child-var)
+                              (when release-thunk    hook-var)))
+           (remove nil (list (when effective-pid effective-pid)
+                              (when child-process    child-process)
+                              (when release-thunk    release-thunk)))
       (cond
         (dump-p
          (let ((gen (funcall (find-symbol "COMPILE-SCRIPT" '#:whistler/bpftrace) source))
@@ -1145,38 +1148,65 @@
     (setf (sb-alien:deref arr n) (sb-sys:int-sap 0))
     arr))
 
+(defun split-cmd (cmd)
+  "Whitespace-split CMD into tokens — matches bpftrace's
+   util::split_string. No shell semantics: quoting, redirection, and
+   pipes pass through as literal arg tokens."
+  (loop with n = (length cmd)
+        with i = 0
+        while (< i n)
+        do (loop while (and (< i n) (member (char cmd i) '(#\Space #\Tab)))
+                 do (cl:incf i))
+        when (< i n)
+          collect (let ((start i))
+                    (loop while (and (< i n)
+                                     (not (member (char cmd i) '(#\Space #\Tab))))
+                          do (cl:incf i))
+                    (subseq cmd start i))))
+
+(defun resolve-binary (name)
+  "If NAME has no `/', look it up under /usr/bin, /bin, /usr/sbin, /sbin."
+  (cond
+    ((find #\/ name) name)
+    (t (or (some (lambda (dir)
+                   (let ((p (format nil "~A/~A" dir name)))
+                     (when (probe-file p) p)))
+                 '("/usr/bin" "/bin" "/usr/sbin" "/sbin"))
+           name))))
+
 (defun spawn-traced-process (cmd)
-  "Fork CMD via /bin/sh -c with PTRACE_TRACEME — child stops at exec
-   entry, parent then has a clear window to attach probes. Returns a
-   TRACED-CHILD whose RELEASE thunk PTRACE_DETACHes (and SIGCONTs)
-   the child."
-  (let ((pid (sb-posix:fork)))
-    (cond
-      ((zerop pid)
-       ;; --- Child side ---
-       (handler-case
-           (progn
-             (%ptrace +ptrace-traceme+ 0 0 0)
-             (%raise +sigstop+)
-             ;; SIGSTOP put us to sleep; the parent's PTRACE_DETACH
-             ;; resumes us here. Now exec the user command.
-             (let ((argv (build-cstr-array (list "sh" "-c" cmd))))
-               (%execve "/bin/sh" argv (sb-sys:int-sap 0))))
-         (error () nil))
-       ;; If execve returned, something went wrong.
-       (%_exit 127))
-      (t
-       ;; --- Parent side ---
-       ;; Wait for the child's SIGSTOP so we know it's stopped at
-       ;; exec entry before we attach probes.
-       (multiple-value-bind (waited status) (sb-posix:waitpid pid 0)
-         (declare (ignore waited status)))
-       (make-traced-child
-        :pid pid
-        :release (lambda ()
-                   (handler-case
-                       (%ptrace +ptrace-detach+ pid 0 0)
-                     (error () nil))))))))
+  "Whitespace-split CMD, fork+PTRACE_TRACEME the first token, exec it
+   with the rest as argv. No shell wrapper — matches bpftrace's
+   `-c CMD' behaviour, so redirects/pipes/quotes pass through as
+   literal arg tokens (the spawned binary sees them as-is).
+
+   The child stops at exec entry; release-traced-process
+   PTRACE_DETACHes to resume."
+  (let* ((args (split-cmd cmd))
+         (binary (or (first args) (error "-c needs a command")))
+         (path (resolve-binary binary)))
+    (let ((pid (sb-posix:fork)))
+      (cond
+        ((zerop pid)
+         ;; --- Child side ---
+         (handler-case
+             (progn
+               (%ptrace +ptrace-traceme+ 0 0 0)
+               (%raise +sigstop+)
+               (let ((argv (build-cstr-array args)))
+                 (%execve path argv (sb-sys:int-sap 0))))
+           (error () nil))
+         (%_exit 127))
+        (t
+         ;; --- Parent side ---
+         (multiple-value-bind (waited status) (sb-posix:waitpid pid 0)
+           (declare (ignore waited status)))
+         (make-traced-child
+          :pid pid
+          :release (lambda ()
+                     (handler-case
+                         (%ptrace +ptrace-detach+ pid 0 0)
+                       (error () nil)))))))))
 
 (defun release-traced-process (child)
   "Resume the ptrace-stopped child after probes are attached."
