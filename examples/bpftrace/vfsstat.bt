@@ -1,0 +1,13 @@
+// vfsstat.bt — count VFS operations, system-wide.
+//
+// One map per VFS op. After Ctrl-C, each @counter prints its total.
+// All four kprobes attach to stable kernel symbols.
+
+BEGIN {
+  printf("Counting VFS ops. Hit Ctrl-C to summarise.\n");
+}
+
+kprobe:vfs_read     { @reads++; }
+kprobe:vfs_write    { @writes++; }
+kprobe:vfs_fsync    { @fsyncs++; }
+kprobe:vfs_open     { @opens++; }

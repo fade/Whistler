@@ -130,10 +130,13 @@
    TRACEPOINT-NAME is e.g. \"tracepoint/sched/sched_process_fork\"
    or \"sched/sched_process_fork\".
    Opens a single perf event (pid=-1, cpu=0) matching libbpf's behavior.
+   The kernel uses a per-tracepoint shared prog array, so attaching on
+   one CPU covers events from every CPU; doing a per-CPU loop with the
+   same prog trips EEXIST in perf_event_attach_bpf_prog.
    Returns an attachment that can be passed to detach."
   (let* ((tp-id (resolve-tracepoint-id tracepoint-name))
          (attr (make-perf-attr +perf-type-tracepoint+ tp-id))
-         (fds (attach-perf-bpf attr prog-fd :per-cpu t)))
+         (fds (attach-perf-bpf attr prog-fd)))
     (make-attachment :type :tracepoint :perf-fds fds :prog-fd prog-fd)))
 
 ;;; ========== Uprobe attachment ==========

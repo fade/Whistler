@@ -1,0 +1,27 @@
+// biolatency.bt — block I/O latency histogram, microseconds.
+//
+// Whistler-bpftrace port of brendangregg's biolatency.bt.
+//
+// NOTE: blk_account_io_start was inlined out of the block layer in
+// Linux 5.17 (commit be6bfe36 and friends). On newer kernels this
+// script attaches successfully on some distros that re-exported the
+// symbol, and fails with EINVAL ("Invalid argument") on others.
+// For a portable counter-style example see vfs_read_count.bt.
+
+BEGIN {
+  printf("Tracing block device I/O... Hit Ctrl-C to end.\n");
+}
+
+kprobe:blk_account_io_start {
+  @start[arg0] = nsecs;
+}
+
+kprobe:blk_account_io_done /@start[arg0]/ {
+  $delta = nsecs - @start[arg0];
+  @usecs = hist($delta / 1000);
+  delete(@start[arg0]);
+}
+
+END {
+  clear(@start);
+}

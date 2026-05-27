@@ -43,7 +43,7 @@
                 `(defmacro ,name ()
                    ,docstring
                    (let ((offset (cdr (assoc ,key (pt-regs-offsets)))))
-                     `(ctx-load u64 ,offset)))))
+                     `(ctx u64 ,offset)))))
   (def-pt-regs-accessor pt-regs-parm1 :parm1 "First function argument from pt_regs.")
   (def-pt-regs-accessor pt-regs-parm2 :parm2 "Second function argument from pt_regs.")
   (def-pt-regs-accessor pt-regs-parm3 :parm3 "Third function argument from pt_regs.")
@@ -503,8 +503,8 @@
 
 (defmacro with-packet ((data data-end &key (min-len 0)) &body body)
   "Bind DATA and DATA-END from the XDP context, then check minimum length."
-  `(let ((,data     u64 (ctx-load u32 0))
-         (,data-end u64 (ctx-load u32 4)))
+  `(let ((,data     u64 (ctx u32 0))
+         (,data-end u64 (ctx u32 4)))
      (if (> (+ ,data ,min-len) ,data-end)
          (return XDP_PASS)
          (progn ,@body))))
@@ -607,16 +607,16 @@
 
 (defmacro tc-data ()
   "Load TC (__sk_buff) context data pointer."
-  `(ctx-load u32 76))
+  `(ctx u32 76))
 
 (defmacro tc-data-end ()
   "Load TC (__sk_buff) context data-end pointer."
-  `(ctx-load u32 80))
+  `(ctx u32 80))
 
 (defmacro with-tc-packet ((data data-end &key (min-len 0)) &body body)
   "Bind DATA and DATA-END from the TC (__sk_buff) context, then check minimum length."
-  `(let ((,data     u64 (ctx-load u32 76))
-         (,data-end u64 (ctx-load u32 80)))
+  `(let ((,data     u64 (ctx u32 76))
+         (,data-end u64 (ctx u32 80)))
      (if (> (+ ,data ,min-len) ,data-end)
          (return TC_ACT_OK)
          (progn ,@body))))
@@ -744,7 +744,7 @@
      (deftracepoint sched/sched-switch prev-pid prev-state next-pid)
 
    Generates: (tp-prev-pid), (tp-prev-state), (tp-next-pid)
-   Each expands to (ctx-load TYPE OFFSET)."
+   Each expands to (ctx TYPE OFFSET)."
   (let* ((name-str (substitute #\_ #\- (string-downcase
                                           (symbol-name category/event))))
          (slash (position #\/ name-str))
@@ -785,7 +785,7 @@
                  (type (tracepoint-type size signed-p array-size)))
             (when type
               (push `(defmacro ,accessor ()
-                       '(ctx-load ,type ,offset))
+                       '(ctx ,type ,offset))
                     forms))
             ;; For array fields, generate a -ptr accessor
             (when (plusp array-size)
@@ -793,6 +793,6 @@
                                              (string-upcase lisp-name))
                                       (symbol-package category/event))))
                 (push `(defmacro ,ptr-name ()
-                         '(+ (ctx-load u64 0) ,offset))
+                         '(+ (ctx u64 0) ,offset))
                       forms))))))
       `(progn ,@(nreverse forms)))))

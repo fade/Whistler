@@ -1,0 +1,12 @@
+// vfs_read_count.bt — count VFS read calls per pid.
+//
+// Stable kernel symbol: vfs_read has been around since the 2.6 days.
+// Runs anywhere with cap_bpf + cap_perfmon.
+
+BEGIN {
+  printf("Counting vfs_read by pid. Hit Ctrl-C to end.\n");
+}
+
+kprobe:vfs_read {
+  @reads[pid]++;
+}

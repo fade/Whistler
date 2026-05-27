@@ -5,9 +5,6 @@
   :license "MIT"
   :depends-on ()
   :in-order-to ((test-op (test-op "whistler/tests")))
-  :build-operation "program-op"
-  :build-pathname "../whistler"
-  :entry-point "whistler:main"
   :serial t
   :pathname "src/"
   :components ((:file "packages")
@@ -45,9 +42,35 @@
                (:file "loader")
                (:file "session")))
 
+(defsystem "whistler/cli"
+  :description "CLI binary — bundles whistler + loader + bpftrace into one self-contained executable"
+  :version "1.8.0"
+  :author "Anthony Green <green@moxielogic.com>"
+  :license "MIT"
+  :depends-on ("whistler" "whistler/loader" "whistler/bpftrace")
+  :build-operation "program-op"
+  :build-pathname "whistler"
+  :entry-point "whistler:main"
+  :components ())
+
+(defsystem "whistler/bpftrace"
+  :description "bpftrace frontend — parses bpftrace scripts and compiles them via Whistler"
+  :version "0.1.0"
+  :author "Anthony Green <green@moxielogic.com>"
+  :license "MIT"
+  :depends-on ("whistler" "whistler/loader" "iparse")
+  :serial t
+  :pathname "src/bpftrace/"
+  :components ((:file "packages")
+               (:file "grammar")
+               (:file "ast")
+               (:file "codegen")
+               (:file "runtime")
+               (:file "bpftrace")))
+
 (defsystem "whistler/tests"
   :description "Whistler test suite"
-  :depends-on ("whistler" "whistler/loader" "fiveam")
+  :depends-on ("whistler" "whistler/loader" "whistler/bpftrace" "fiveam")
   :serial t
   :pathname "tests/"
   :components ((:file "package")
@@ -65,4 +88,5 @@
                (:file "test-percpu")
                (:file "test-programs")
                (:file "test-regalloc")
-               (:file "test-torture")))
+               (:file "test-torture")
+               (:file "test-bpftrace")))

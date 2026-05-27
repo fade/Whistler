@@ -1,0 +1,21 @@
+// runqlat.bt — run-queue latency histogram, microseconds.
+//
+// Whistler-bpftrace port of the bpftrace tools/runqlat.bt.
+
+BEGIN {
+  printf("Tracing run-queue latency... Hit Ctrl-C to end.\n");
+}
+
+tracepoint:sched:sched_wakeup {
+  @qtime[args->pid] = nsecs;
+}
+
+tracepoint:sched:sched_wakeup_new {
+  @qtime[args->pid] = nsecs;
+}
+
+tracepoint:sched:sched_switch /@qtime[args->next_pid]/ {
+  $delta = nsecs - @qtime[args->next_pid];
+  @usecs = hist($delta / 1000);
+  delete(@qtime[args->next_pid]);
+}

@@ -827,8 +827,10 @@
            (member "-V" args :test #'string=))
        (format t "whistler ~a~%" *version*))
 
-      ((or (null args) (member "--help" args :test #'string=)
-           (member "-h" args :test #'string=))
+      ((or (null args)
+           (and (first args)
+                (or (string= (first args) "--help")
+                    (string= (first args) "-h"))))
        (format t "whistler ~a - copyright (C) 2026 Anthony Green <green@moxielogic.com>~%"
                *version*)
        (format t "~%A Lisp that compiles to eBPF.~%")
@@ -841,6 +843,7 @@
        (format t "                                  Compile .lisp to .bpf.o ELF object~%")
        (format t "   disasm INPUT                   Disassemble to stdout~%")
        (format t "   doctor                         Check local eBPF dev prerequisites~%")
+       (format t "   bpftrace [SCRIPT|-e PROG]      Run a bpftrace-syntax script~%")
        (format t "   version                        Show version information~%")
        (format t "~%Compile options:~%")
        (format t "   -o FILE                        Output .bpf.o path~%")
@@ -917,6 +920,77 @@
       ((string= (first args) "doctor")
        (doctor))
 
+      ((string= (first args) "bpftrace")
+       (run-bpftrace-subcommand (rest args)))
+
       (t
        (format *error-output* "Unknown command: ~a~%" (first args))
        (uiop:quit 1)))))
+
+(defun run-bpftrace-subcommand (args)
+  "Dispatch `whistler bpftrace …`. Loads whistler/bpftrace lazily so
+   the main system stays independent."
+  (flet ((require-bpftrace ()
+           (unless (find-package '#:whistler/bpftrace)
+             (handler-case (asdf:load-system "whistler/bpftrace" :verbose nil)
+               (error (e)
+                 (format *error-output*
+                         "Error: could not load whistler/bpftrace: ~A~%"
+                         e)
+                 (uiop:quit 1))))
+           (find-package '#:whistler/bpftrace)))
+    (cond
+      ((or (null args) (member "--help" args :test #'string=)
+           (member "-h" args :test #'string=))
+       (format t "Usage: whistler bpftrace [OPTIONS] [SCRIPT]~%")
+       (format t "~%Compile and run a bpftrace script via Whistler.~%")
+       (format t "~%Options:~%")
+       (format t "  -e PROGRAM     Inline script text (instead of a file)~%")
+       (format t "  --dump         Print generated Whistler forms and exit (no kernel load)~%")
+       (format t "  -h, --help     Show this help~%")
+       (format t "~%Examples:~%")
+       (format t "  whistler bpftrace examples/bpftrace/biolatency.bt~%")
+       (format t "  whistler bpftrace -e 'kprobe:vfs_read { @[comm] = count(); }'~%")
+       (format t "  whistler bpftrace --dump examples/bpftrace/biolatency.bt~%"))
+
+      (t
+       (let* ((dump-p (or (member "--dump" args :test #'string=)
+                          (member "-d"     args :test #'string=)))
+              (e-pos  (position "-e" args :test #'string=))
+              (source
+                (cond
+                  (e-pos
+                   (or (nth (1+ e-pos) args)
+                       (progn (format *error-output*
+                                      "Error: -e requires an argument~%")
+                              (uiop:quit 1))))
+                  (t
+                   (let ((path (find-if (lambda (a)
+                                          (and (not (and (>= (length a) 1)
+                                                         (char= (char a 0) #\-)))
+                                               (not (and e-pos
+                                                         (string= a (nth (1+ e-pos) args))))))
+                                        args)))
+                     (unless path
+                       (format *error-output*
+                               "Error: no script (pass a path or -e PROGRAM)~%")
+                       (uiop:quit 1))
+                     (with-open-file (s path :direction :input)
+                       (let* ((buf (make-string (file-length s)))
+                              (n   (read-sequence buf s)))
+                         (subseq buf 0 n))))))))
+         (require-bpftrace)
+         (cond
+           (dump-p
+            (let ((gen (funcall (find-symbol "COMPILE-SCRIPT" '#:whistler/bpftrace)
+                                source))
+                  (*print-pretty* t)
+                  (*print-right-margin* 90))
+              (format t "~&;; ----- defmap forms -----~%")
+              (dolist (m (getf gen :maps)) (format t "~S~%" m))
+              (format t "~&;; ----- defprog forms -----~%")
+              (dolist (p (getf gen :progs)) (format t "~S~%" p))
+              (format t "~&;; ----- user-side probes (BEGIN/END/interval) -----~%")
+              (format t "~S~%" (getf gen :user-probes))))
+           (t
+            (funcall (find-symbol "RUN" '#:whistler/bpftrace) source))))))))
