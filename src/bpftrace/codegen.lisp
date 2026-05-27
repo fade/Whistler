@@ -341,11 +341,27 @@
        (t (unsupported "arg~D — only arg0..arg5 are wired up" n))))
     ((:kretprobe :uretprobe)
      (unsupported "arg~D in ret-probe — retval is the only accessor" n))
+    ;; In fentry / fexit programs the ctx is `__u64 ctx[N]` where
+    ;; ctx[i] is the i-th argument to the traced function. Direct
+    ;; ctx-load — no pt_regs indirection.
+    ((:kfunc :kretfunc)
+     `(whistler::ctx ,(intern "U64" :whistler) ,(* n 8)))
     (:tracepoint (unsupported "tracepoint arg~D — use args->field" n))))
 
 (defun lower-retval ()
   (ecase (first *probe-spec*)
-    ((:kretprobe :uretprobe) '(whistler:pt-regs-ret))))
+    ((:kretprobe :uretprobe) '(whistler:pt-regs-ret))
+    (:kretfunc
+     ;; In fexit, retval lives at ctx[nargs]. Look up nargs in the
+     ;; kernel BTF so the offset matches the target function's true
+     ;; signature.
+     (let* ((fname (second *probe-spec*))
+            (vmbtf (whistler:ensure-vmlinux-btf)))
+       (multiple-value-bind (id nargs) (whistler:btf-find-func vmbtf fname)
+         (declare (ignore id))
+         (unless nargs
+           (unsupported "kretfunc:~A — function not found in vmlinux BTF" fname))
+         `(whistler::ctx ,(intern "U64" :whistler) ,(* nargs 8)))))))
 
 (defun lower-bin (expr)
   (let ((op  (getf (cdr expr) :op))
@@ -987,6 +1003,7 @@
 
 (defparameter *kernel-spec-tags*
   '(:kprobe :kretprobe :uprobe :uretprobe
+    :kfunc :kretfunc
     :tracepoint :begin :end :interval :profile))
 
 (defun interval-period-ns (spec)
@@ -1007,6 +1024,12 @@
   (ecase (first spec)
     (:kprobe     (values :kprobe       (format nil "kprobe/~A" (second spec))))
     (:kretprobe  (values :kretprobe    (format nil "kretprobe/~A" (second spec))))
+    ;; kfunc / kretfunc → BPF_PROG_TYPE_TRACING with fentry / fexit
+    ;; expected-attach-type. The section name carries the target
+    ;; function so the loader can resolve its BTF func ID at load
+    ;; time.
+    (:kfunc      (values :tracing      (format nil "fentry/~A" (second spec))))
+    (:kretfunc   (values :tracing      (format nil "fexit/~A"  (second spec))))
     (:uprobe     (values :uprobe
                          (format nil "uprobe/~A:~A" (second spec) (third spec))))
     (:uretprobe  (values :uretprobe

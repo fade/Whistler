@@ -148,6 +148,7 @@
            ;; Kernel integration
            #:deftracepoint #:import-kernel-struct
            #:reset-vmlinux-btf-cache
+           #:btf-find-func #:ensure-vmlinux-btf
            ;; Memory operations
            #:memset #:memcpy
            ;; User-space iteration

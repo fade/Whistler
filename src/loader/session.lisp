@@ -160,9 +160,17 @@
                (setf (aref insns (+ offset 6)) (logand (ash fd -16) #xff))
                (setf (aref insns (+ offset 7)) (logand (ash fd -24) #xff)))))
          (let* ((eat (section-to-expected-attach-type sec-name))
-                (btf-id (when (= prog-type +bpf-prog-type-lsm+)
-                          (resolve-btf-func-id
-                           (lsm-hook-to-btf-func sec-name))))
+                (btf-id
+                  (cond
+                    ((= prog-type +bpf-prog-type-lsm+)
+                     (resolve-btf-func-id (lsm-hook-to-btf-func sec-name)))
+                    ((and (>= (length sec-name) 7)
+                          (string= (subseq sec-name 0 7) "fentry/"))
+                     (resolve-btf-func-id (subseq sec-name 7)))
+                    ((and (>= (length sec-name) 6)
+                          (string= (subseq sec-name 0 6) "fexit/"))
+                     (resolve-btf-func-id (subseq sec-name 6)))
+                    (t nil)))
                 (fd (load-program insns prog-type license
                                   :expected-attach-type eat
                                   :attach-btf-id btf-id)))

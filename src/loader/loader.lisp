@@ -58,8 +58,23 @@
 
           ;; Load program
           (let* ((eat (section-to-expected-attach-type sec-name))
+                 (btf-id (cond
+                           ;; lsm/<hook> → BTF func "bpf_lsm_<hook>"
+                           ((and (>= (length sec-name) 4)
+                                 (string= (subseq sec-name 0 4) "lsm/"))
+                            (resolve-btf-func-id
+                             (lsm-hook-to-btf-func sec-name)))
+                           ;; fentry/<func> / fexit/<func> → BTF func of <func>
+                           ((and (>= (length sec-name) 7)
+                                 (string= (subseq sec-name 0 7) "fentry/"))
+                            (resolve-btf-func-id (subseq sec-name 7)))
+                           ((and (>= (length sec-name) 6)
+                                 (string= (subseq sec-name 0 6) "fexit/"))
+                            (resolve-btf-func-id (subseq sec-name 6)))
+                           (t nil)))
                  (fd (load-program insns prog-type license
-                                   :expected-attach-type eat)))
+                                   :expected-attach-type eat
+                                   :attach-btf-id btf-id)))
             (format t "Loaded ~a: ~d insns, fd=~d, section=~a~%"
                     prog-name (/ (length insns) 8) fd sec-name)
             (push (make-prog-info :name prog-name

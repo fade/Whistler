@@ -171,6 +171,10 @@
                       :section section :target target
                       :reason "could not parse frequency from profile section"))
              (whistler/loader::attach-perf-profile fd freq)))
+          ((string= kind "fentry")
+           (whistler/loader:attach-fentry fd nil))
+          ((string= kind "fexit")
+           (whistler/loader:attach-fentry fd t))
           (t (error 'bpftrace-attach-error
                     :section section :target target
                     :reason (format nil "unknown probe kind ~A" kind))))

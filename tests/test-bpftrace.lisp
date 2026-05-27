@@ -181,3 +181,17 @@
     (sb-sys:with-pinned-objects (bytes)
       (is (string= "::1" (whistler/bpftrace::format-ipv6
                           (sb-sys:vector-sap bytes) 0))))))
+
+(test codegen-kfunc-section-and-type
+  "kfunc/kretfunc compile to BPF_PROG_TYPE_TRACING with fentry/fexit
+   section names."
+  (let* ((src "kfunc:vfs_read { @ = count(); }")
+         (gen (whistler/bpftrace:compile-script src))
+         (prog (first (getf gen :progs))))
+    (is (eq :tracing (getf (third prog) :type)))
+    (is (string= "fentry/vfs_read" (getf (third prog) :section))))
+  (let* ((src "kretfunc:vfs_read { @ = count(); }")
+         (gen (whistler/bpftrace:compile-script src))
+         (prog (first (getf gen :progs))))
+    (is (eq :tracing (getf (third prog) :type)))
+    (is (string= "fexit/vfs_read" (getf (third prog) :section)))))

@@ -396,6 +396,23 @@
                                   (handler-case (sb-posix:close link-fd)
                                     (error () nil)))))))
 
+(defun attach-fentry (prog-fd &optional retprobe-p)
+  "Attach a BPF fentry (or fexit when RETPROBE-P) program via
+   BPF_LINK_CREATE. attach_btf_id is already baked into the program
+   at load time; we just open the link with the right attach type."
+  (let ((buf (make-attr-buf 168))
+        (attach-type (if retprobe-p +bpf-trace-fexit+ +bpf-trace-fentry+)))
+    (put-u32 buf 0 prog-fd)
+    (put-u32 buf 4 0)
+    (put-u32 buf 8 attach-type)
+    (let ((link-fd (%bpf +bpf-link-create+ buf 168
+                         (if retprobe-p "fexit-link-create" "fentry-link-create"))))
+      (make-attachment :type (if retprobe-p :fexit :fentry)
+                       :perf-fds nil :prog-fd prog-fd
+                       :cleanup (lambda ()
+                                  (handler-case (sb-posix:close link-fd)
+                                    (error () nil)))))))
+
 ;;; ========== XDP attachment ==========
 
 (defun attach-xdp (prog-fd interface-name &key (mode "xdp"))

@@ -84,6 +84,12 @@
     ((and (>= (length section-name) 4)
           (string= (subseq section-name 0 4) "lsm/"))
      +bpf-prog-type-lsm+)
+    ;; fentry/fexit — BPF_PROG_TYPE_TRACING. The expected_attach_type
+    ;; distinguishes the two (24=fentry, 25=fexit).
+    ((and (>= (length section-name) 7)
+          (or (string= (subseq section-name 0 7) "fentry/")
+              (string= (subseq section-name 0 6) "fexit/")))
+     +bpf-prog-type-tracing+)
     ;; Cgroup program types
     ((and (>= (length section-name) 10)
           (string= (subseq section-name 0 10) "cgroup_skb"))
@@ -127,6 +133,12 @@
     ((and (>= (length section-name) 4)
           (string= (subseq section-name 0 4) "lsm/"))
      +bpf-lsm-mac+)
+    ((and (>= (length section-name) 7)
+          (string= (subseq section-name 0 7) "fentry/"))
+     +bpf-trace-fentry+)
+    ((and (>= (length section-name) 6)
+          (string= (subseq section-name 0 6) "fexit/"))
+     +bpf-trace-fexit+)
     (t nil)))
 
 ;;; ========== Program loading ==========

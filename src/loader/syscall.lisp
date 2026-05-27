@@ -64,6 +64,9 @@
 (defconstant +bpf-prog-type-cgroup-sock+ 9)
 (defconstant +bpf-prog-type-cgroup-sock-addr+ 18)
 (defconstant +bpf-prog-type-tracing+ 26)
+;; Expected-attach-type values for BPF_PROG_TYPE_TRACING.
+(defconstant +bpf-trace-fentry+ 24)
+(defconstant +bpf-trace-fexit+  25)
 (defconstant +bpf-prog-type-lsm+ 29)
 (defconstant +bpf-prog-type-syscall+ 31)
 (defconstant +bpf-prog-type-raw-tracepoint+ 17)

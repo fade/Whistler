@@ -111,6 +111,25 @@
                     (string= (btf-string strtab (getf rec :name-off)) name))
           return (values id rec))))
 
+(defun btf-find-func (vmbtf name)
+  "Find a kernel FUNC by name. Returns (values FUNC-ID NARGS), or NIL.
+   NARGS is read from the linked FUNC_PROTO's vlen."
+  (let ((strtab (vmlinux-btf-strtab vmbtf))
+        (types  (vmlinux-btf-types vmbtf)))
+    (loop for id from 1 below (length types)
+          for rec = (aref types id)
+          when (and rec
+                    (= (getf rec :kind) +btf-kind-func+)
+                    (string= (btf-string strtab (getf rec :name-off)) name))
+            return (let* ((proto-id (getf rec :size))
+                          (proto    (when (and proto-id
+                                               (< proto-id (length types)))
+                                      (aref types proto-id)))
+                          (nargs    (and proto
+                                         (= (getf proto :kind) +btf-kind-func-proto+)
+                                         (getf proto :vlen))))
+                     (values id (or nargs 0))))))
+
 (defun btf-resolve-type (vmbtf type-id)
   "Resolve a BTF type through typedefs, const, volatile, etc.
    Returns the underlying kind, size, and name."

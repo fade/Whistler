@@ -166,6 +166,11 @@
       (:end-spec        '(:end))
       (:kprobe-spec     (list :kprobe (text-of (first-tagged inner :ident))))
       (:kretprobe-spec  (list :kretprobe (text-of (first-tagged inner :ident))))
+      ;; kfunc[:vmlinux]:funcname — last :ident is the function. The
+      ;; optional "vmlinux" token is silently dropped; we only support
+      ;; the vmlinux module today.
+      (:kfunc-spec      (list :kfunc    (text-of (car (last (all-tagged inner :ident))))))
+      (:kretfunc-spec   (list :kretfunc (text-of (car (last (all-tagged inner :ident))))))
       (:uprobe-spec
        (list :uprobe
              (text-of (first-tagged inner :upath))
