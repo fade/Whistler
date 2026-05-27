@@ -155,7 +155,8 @@
            #:deftracepoint #:import-kernel-struct
            #:reset-vmlinux-btf-cache
            #:btf-find-func #:btf-func-params #:btf-enum-values
-           #:btf-find-struct #:btf-struct-fields #:ensure-vmlinux-btf
+           #:btf-find-struct #:btf-struct-fields #:btf-resolve-array
+           #:ensure-vmlinux-btf
            ;; Memory operations
            #:memset #:memcpy
            ;; User-space iteration

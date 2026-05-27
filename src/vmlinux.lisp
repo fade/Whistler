@@ -246,7 +246,11 @@
 
 (defun btf-struct-fields (vmbtf struct-type-id)
   "Extract fields from a BTF struct, recursively flattening anonymous
-   struct/union members. Returns list of (name type offset size)."
+   struct/union members. Returns list of (name type offset size
+   resolved-name type-id). The 6th value (type-id) is the raw BTF
+   type-id of the field's type — useful for walking into named
+   anonymous unions (e.g. `struct in6_addr::in6_u'), whose resolved
+   name is empty and so can't be looked up by name."
   (let* ((types (vmlinux-btf-types vmbtf))
          (strtab (vmlinux-btf-strtab vmbtf))
          (type-data (vmlinux-btf-type-data vmbtf)))
@@ -268,7 +272,8 @@
                          ;; Named field: resolve type and collect
                          (multiple-value-bind (bpf-type size resolved-name)
                              (btf-resolve-type vmbtf member-type-id)
-                           (push (list fname bpf-type byte-offset size resolved-name)
+                           (push (list fname bpf-type byte-offset size
+                                       resolved-name member-type-id)
                                  fields))
                          ;; Anonymous member: recurse into it if struct/union
                          (let ((member-rec (when (< member-type-id (length types))
@@ -285,7 +290,8 @@
 ;;; ========== Context struct BTF lookup ==========
 
 (defun btf-resolve-array (vmbtf type-id)
-  "Resolve a BTF array type. Returns (values elem-bpf-type nelems) or NIL."
+  "Resolve a BTF array type. Returns (values elem-bpf-type nelems
+   elem-size) or NIL when TYPE-ID is not an array kind."
   (let* ((types (vmlinux-btf-types vmbtf))
          (type-data (vmlinux-btf-type-data vmbtf))
          (rec (when (and type-id (< type-id (length types)))
@@ -296,9 +302,9 @@
              (nelems (btf-u32 type-data (+ data-off 8))))
         (multiple-value-bind (bpf-type size name)
             (btf-resolve-type vmbtf elem-type-id)
-          (declare (ignore size name))
+          (declare (ignore name))
           (when bpf-type
-            (values bpf-type nelems)))))))
+            (values bpf-type nelems size)))))))
 
 (defun btf-member-raw-type-id (vmbtf member-type-id)
   "Follow typedef/const/volatile/restrict chain without collapsing to a scalar.

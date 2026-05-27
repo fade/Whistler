@@ -375,6 +375,26 @@
          (text (format nil "~S" (cdddr (first (getf gen :progs))))))
     (is (search "MAP-LOOKUP" text))))
 
+(test codegen-ntop-var-assign-v4
+  "\$v = ntop(u32) backs \$v with a 17-byte slot and writes
+   family=AF_INET (2) + 4 bytes of the address."
+  (let* ((src "kprobe:vfs_read { $d = ntop(arg0); }")
+         (gen (whistler/bpftrace:compile-script src))
+         (text (format nil "~S" (cdddr (first (getf gen :progs))))))
+    (is (search "STRUCT-ALLOC 17" text))
+    (is (search "STORE WHISTLER::U8 WHISTLER::$D 0 2" text))
+    (is (search "STORE WHISTLER::U32 WHISTLER::$D 1" text))))
+
+(test codegen-ntop-printf-emits-slot
+  "printf(\"%s\", \$ntop-var) emits the 17-byte slot via the
+   :ipv-any printf-arg type — userspace decodes family + address."
+  (let* ((src "kprobe:vfs_read { $d = ntop(arg0); printf(\"%s\", $d); }")
+         (gen (whistler/bpftrace:compile-script src))
+         (table (getf gen :printf-table))
+         (entry (first table))
+         (arg-types (third entry)))
+    (is (eq :ipv-any (first arg-types)))))
+
 (test codegen-chained-field-access
   "`$sk = (struct sock *)retval; $sk.__sk_common.skc_family' walks
    through the embedded sock_common struct and probe-reads at the

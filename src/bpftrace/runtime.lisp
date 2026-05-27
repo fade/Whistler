@@ -916,6 +916,24 @@
                                       ((eq ty :ipv6)
                                        (prog1 (format-ipv6 sap off)
                                          (incf off 16)))
+                                      ((eq ty :ipv-any)
+                                       ;; 1 family byte + 16 bytes addr.
+                                       ;; Family AF_INET (2) → v4 of bytes
+                                       ;; 1..4; AF_INET6 (10) → v6 of
+                                       ;; bytes 1..16; anything else → 0.0.0.0.
+                                       (let ((family (sb-sys:sap-ref-8 sap off)))
+                                         (prog1
+                                             (cond
+                                               ((= family 2)
+                                                (format nil "~D.~D.~D.~D"
+                                                        (sb-sys:sap-ref-8 sap (+ off 1))
+                                                        (sb-sys:sap-ref-8 sap (+ off 2))
+                                                        (sb-sys:sap-ref-8 sap (+ off 3))
+                                                        (sb-sys:sap-ref-8 sap (+ off 4))))
+                                               ((= family 10)
+                                                (format-ipv6 sap (+ off 1)))
+                                               (t "0.0.0.0"))
+                                           (incf off 17))))
                                       ((and (consp ty) (eq (car ty) :string))
                                        (let ((size (cdr ty)))
                                          (prog1 (sap-read-string-fixed

@@ -349,6 +349,16 @@
   "Per-probe alist VAR-NAME → STRUCT-NAME. Populated from `$v =
    (struct X *)EXPR' assignments so later `$v.field' accesses can
    walk BTF for the right offsets without seeing the cast again.")
+
+(defvar *ntop-vars* nil
+  "Per-probe list of VAR-NAME strings whose value comes from `ntop(…)'.
+   ntop conjures `a string typed value' that needs runtime-formatted
+   v4/v6 rendering; we back the var with a 17-byte stack slot (1
+   family byte + 16 address bytes) so the assignment can write either
+   family and the matching `printf(\"%s\", \$v)' can emit the slot.")
+
+(defconstant +bt-ntop-slot-size+ 17
+  "1 byte family + 16 bytes address — covers both AF_INET and AF_INET6.")
 (defvar *map-table* nil)
 
 (defun lower-expr (expr)
@@ -702,6 +712,17 @@
       ((string= name "reg")    (lower-reg-call (getf (cdr expr) :args)))
       ((string= name "kaddr")  (lower-kaddr-call (getf (cdr expr) :args)))
       ((string= name "has_key") (lower-has-key-call (getf (cdr expr) :args)))
+      ;; `bswap(x)' — byte-swap. bpftrace's bswap on a u16/u32 reverses
+      ;; the byte order. We pick the width from key context; for the
+      ;; common `bswap(\$port)' (a u16 from skc_dport) the 16-bit
+      ;; version is what we need. Use the 16-bit swap pattern that
+      ;; works for u16 values; higher bytes pass through if any are set.
+      ((string= name "bswap")
+       (let ((x (gensym "BSWAP")))
+         `(let ((,x ,(lower-expr (first (getf (cdr expr) :args)))))
+            (whistler::logior
+             (whistler::ash (whistler::logand ,x #xff) 8)
+             (whistler::ash (whistler::logand ,x #xff00) -8)))))
       ;; `getopt(NAME, DEFAULT, HELP)' — bpftrace's CLI-flag accessor.
       ;; whistler bpftrace doesn't expose user options, so this always
       ;; returns the default value (the second argument).
@@ -954,10 +975,17 @@
      :int                  8 bytes, u64 in record
      (:string . SIZE)      SIZE bytes, NUL-terminated string slot
      :ksym                 8 bytes, kernel address (kallsyms-resolved)
-     :usym                 16 bytes, pid_tgid + user address (symbolizer)"
+     :usym                 16 bytes, pid_tgid + user address (symbolizer)
+     :ipv-any              17 bytes, family byte + 16 address bytes
+                           (a `\$v = ntop(…)' var referenced here)"
   (cond
     ((eq (first expr) :comm)
      (cons :string +bt-comm-len+))
+    ;; A `\$v' whose latest assignment came from ntop(…) — the var
+    ;; holds a pointer to its per-probe 17-byte slot.
+    ((and (eq (first expr) :var)
+          (member (second expr) *ntop-vars* :test #'string-equal))
+     :ipv-any)
     ((or (str-call-p expr) (kstr-call-p expr))
      (let* ((args (getf (cdr expr) :args))
             (n    (when (and (cdr args) (eq (first (second args)) :int))
@@ -1012,6 +1040,7 @@
     ((eq arg-type :usym) 16)
     ((eq arg-type :ipv4) 4)
     ((eq arg-type :ipv6) 16)
+    ((eq arg-type :ipv-any) +bt-ntop-slot-size+)
     ((and (consp arg-type) (eq (car arg-type) :string))   (cdr arg-type))
     ((and (consp arg-type) (eq (car arg-type) :strftime)) 8)  ; just the u64 timestamp
     (t (error "printf-arg-size: unrecognised ~A" arg-type))))
@@ -1090,6 +1119,15 @@
      (let* ((args (getf (cdr arg) :args))
             (ptr  (lower-expr (second args))))
        `(whistler::probe-read-kernel (+ ,rec ,off) 16 ,ptr)))
+    ((eq ty :ipv-any)
+     ;; ARG is a `\$v' that points at its 17-byte ntop slot. Copy the
+     ;; whole slot (1 byte family + 16 bytes address) into the record.
+     (let ((src (lower-expr arg))
+           (i   (gensym "I")))
+       `(whistler::dotimes (,i ,+bt-ntop-slot-size+)
+          (whistler::store
+           whistler::u8 ,rec (+ ,off ,i)
+           (whistler::load whistler::u8 ,src ,i)))))
     ((and (consp ty) (eq (car ty) :string))
      (let ((size (cdr ty)))
        (cond
@@ -1213,44 +1251,45 @@
 (defun lower-chained-field (root-ptr-form root-struct-name chain)
   "Walk BTF for each name in CHAIN, summing offsets through embedded
    structs/unions until a scalar leaf. Emits a single probe_read_kernel
-   from (ROOT-PTR-FORM + total-offset). Pointer-traversal (a chain
-   element whose type is itself a pointer-to-struct that you then
-   dot through) is not yet handled."
-  (let ((vmbtf (whistler:ensure-vmlinux-btf))
-        (current root-struct-name)
-        (total-offset 0)
-        (final-size nil)
-        (final-type nil))
+   from (ROOT-PTR-FORM + total-offset). Walks by raw type-id so
+   anonymous unions inside named fields (e.g. struct in6_addr::in6_u)
+   stay traversable. Pointer-traversal (a mid-chain pointer field
+   you then dot through) is not yet handled."
+  (let* ((vmbtf (whistler:ensure-vmlinux-btf))
+         (current-tid (whistler:btf-find-struct vmbtf root-struct-name))
+         (total-offset 0)
+         (final-size nil)
+         (final-type nil))
+    (unless current-tid
+      (unsupported "field walk: struct ~A not in vmlinux BTF" root-struct-name))
     (dolist (fname chain)
-      (let ((tid (whistler:btf-find-struct vmbtf current)))
-        (unless tid
-          (unsupported "field walk: struct ~A not in vmlinux BTF" current))
-        (let* ((fields (whistler:btf-struct-fields vmbtf tid))
-               (cell   (find fname fields :test #'string= :key #'first)))
-          (unless cell
-            (unsupported "->~A: struct ~A has no such field"
-                         fname current))
-          (let ((bpf-type (second cell))
-                (offset   (third cell))
-                (size     (fourth cell))
-                (sub-name (fifth cell)))
-            (incf total-offset offset)
-            (cond
-              ;; Embedded struct/union — keep walking.
-              ((and (null bpf-type) sub-name (not (string= fname (car (last chain)))))
-               (setf current sub-name))
-              ;; Scalar leaf.
-              ((and (string= fname (car (last chain)))
-                    (member size '(1 2 4 8)))
-               (setf final-size size)
-               (setf final-type (case size
-                                  (1 (intern "U8"  :whistler))
-                                  (2 (intern "U16" :whistler))
-                                  (4 (intern "U32" :whistler))
-                                  (8 (intern "U64" :whistler)))))
-              (t (unsupported
-                  "field chain ~{.~A~} — leaf must be a 1/2/4/8 byte scalar"
-                  chain)))))))
+      (let* ((fields (whistler:btf-struct-fields vmbtf current-tid))
+             (cell   (find fname fields :test #'string= :key #'first)))
+        (unless cell
+          (unsupported "->~A: no such field on current struct" fname))
+        (let ((bpf-type (second cell))
+              (offset   (third cell))
+              (size     (fourth cell))
+              (sub-name (fifth cell))
+              (sub-tid  (sixth cell)))
+          (incf total-offset offset)
+          (cond
+            ;; Embedded struct/union — keep walking by type-id.
+            ((and (null bpf-type) sub-name
+                  (not (string= fname (car (last chain)))))
+             (setf current-tid sub-tid))
+            ;; Scalar leaf.
+            ((and (string= fname (car (last chain)))
+                  (member size '(1 2 4 8)))
+             (setf final-size size)
+             (setf final-type (case size
+                                (1 (intern "U8"  :whistler))
+                                (2 (intern "U16" :whistler))
+                                (4 (intern "U32" :whistler))
+                                (8 (intern "U64" :whistler)))))
+            (t (unsupported
+                "field chain ~{.~A~} — leaf must be a 1/2/4/8 byte scalar"
+                chain))))))
     (let ((scratch (gensym "F")))
       `(let ((,scratch (whistler::struct-alloc ,final-size)))
          (whistler::probe-read-kernel
@@ -1470,11 +1509,127 @@
     (ecase (first lhs)
       (:var
        (let ((sym (var-sym (second lhs))))
-         (ecase op
-           (:=  `(setf ,sym ,(lower-expr rhs)))
-           (:+= `(whistler:incf ,sym ,(lower-expr rhs)))
-           (:-= `(whistler:decf ,sym ,(lower-expr rhs))))))
+         (cond
+           ;; `$v = ntop(…)' on a tracked ntop-var — write the
+           ;; family byte + address bytes into $v's pre-allocated
+           ;; 17-byte slot. $v itself stays a pointer for the
+           ;; duration of the probe.
+           ((and (eq op :=)
+                 (consp rhs) (eq (first rhs) :call)
+                 (stringp (getf (cdr rhs) :name))
+                 (string= (getf (cdr rhs) :name) "ntop")
+                 (member (second lhs) *ntop-vars* :test #'string-equal))
+            (lower-ntop-assign sym (getf (cdr rhs) :args)))
+           (t
+            (ecase op
+              (:=  `(setf ,sym ,(lower-expr rhs)))
+              (:+= `(whistler:incf ,sym ,(lower-expr rhs)))
+              (:-= `(whistler:decf ,sym ,(lower-expr rhs))))))))
       (:map (lower-map-assign lhs op rhs)))))
+
+(defun analyze-chain (expr)
+  "If EXPR is a recognisable field chain, return (values PTR-FORM
+   LEAF-SIZE LEAF-KIND) where PTR-FORM points at the leaf, LEAF-SIZE
+   is its byte size, and LEAF-KIND is :scalar or :array. Walks by
+   the field's raw type-id at each hop so anonymous unions/structs
+   (like `struct in6_addr::in6_u') keep their offsets — looking them
+   up by struct-name would fail since they have empty BTF names."
+  (when (and (consp expr) (eq (first expr) :field))
+    (multiple-value-bind (root struct-name names)
+        (collect-field-chain expr)
+      (when (and root struct-name)
+        (let* ((vmbtf (whistler:ensure-vmlinux-btf))
+               (current-tid (whistler:btf-find-struct vmbtf struct-name))
+               (total 0)
+               (leaf-size nil)
+               (leaf-kind nil))
+          (unless current-tid
+            (unsupported "chain: struct ~A not in vmlinux BTF" struct-name))
+          (loop for (fname . rest) on names
+                for last? = (null rest)
+                do (let* ((fields (whistler:btf-struct-fields vmbtf current-tid))
+                          (cell (find fname fields :test #'string= :key #'first)))
+                     (unless cell
+                       (unsupported "chain ~A: no such field" fname))
+                     (incf total (third cell))
+                     (cond
+                       (last?
+                        (cond
+                          ((and (null (second cell))
+                                (stringp (fifth cell))
+                                (string= (fifth cell) "array"))
+                           ;; Recompute the array's byte size since
+                           ;; btf-resolve-type returns 0 for arrays
+                           ;; (the rec :size field isn't populated;
+                           ;; the array struct that follows carries
+                           ;; elem-type + nelems).
+                           (multiple-value-bind (_etype nelems esize)
+                               (whistler:btf-resolve-array vmbtf (sixth cell))
+                             (declare (ignore _etype))
+                             (setf leaf-size (* (or nelems 0) (or esize 0))))
+                           (setf leaf-kind :array))
+                          (t
+                           (setf leaf-size (fourth cell))
+                           (setf leaf-kind :scalar))))
+                       ;; Mid-chain: advance into the field's type by id.
+                       (t (setf current-tid (sixth cell))))))
+          (values `(whistler::+ ,(root-ptr-form root) ,total)
+                  leaf-size leaf-kind))))))
+
+(defun lower-chain-as-ptr (expr)
+  "Pointer-only chain resolution (no final read). Used by ntop's
+   v6 path where the address argument is a buried u8[16] array."
+  (multiple-value-bind (ptr _size _kind) (analyze-chain expr)
+    (declare (ignore _size _kind))
+    (or ptr (lower-expr expr))))
+
+(defun lower-ntop-assign (slot-sym ntop-args)
+  "Lower `$v = ntop(EXPR)' or `$v = ntop(FAMILY, EXPR)' into stores
+   on SLOT-SYM's pre-allocated 17-byte buffer: family at byte 0,
+   address bytes at 1..(N). v4 (1 arg, or AF_INET) → 4-byte u32
+   store. v6 (AF_INET6 family) → probe_read_kernel of 16 bytes from
+   the pointer arg."
+  (let* ((family-literal
+           (and (cdr ntop-args)
+                (let ((fa (first ntop-args)))
+                  (case (first fa)
+                    (:int      (second fa))
+                    (:constant (resolve-constant (second fa)))))))
+         (addr-expr
+           (if (cdr ntop-args) (second ntop-args) (first ntop-args)))
+         ;; If no explicit family but the addr-expr is a chain ending
+         ;; in a 16-byte array (u8[16]), bpftrace's convention is v6
+         ;; — match that behavior.
+         (chain-info (and (null family-literal)
+                          (multiple-value-list (analyze-chain addr-expr))))
+         (chain-kind (third chain-info))
+         (chain-size (second chain-info))
+         (chain-ptr  (first chain-info)))
+    (cond
+      ;; Two-arg ntop(AF_INET6, ptr) — IPv6, explicit.
+      ((eql family-literal 10)
+       `(progn
+          (whistler::store whistler::u8 ,slot-sym 0 10)
+          (whistler::probe-read-kernel
+           (whistler::+ ,slot-sym 1) 16 ,(lower-chain-as-ptr addr-expr))))
+      ;; One-arg ntop(CHAIN.u8[16]) — IPv6, inferred from leaf shape.
+      ((and (eq chain-kind :array) (eql chain-size 16))
+       `(progn
+          (whistler::store whistler::u8 ,slot-sym 0 10)
+          (whistler::probe-read-kernel
+           (whistler::+ ,slot-sym 1) 16 ,chain-ptr)))
+      ;; One-arg ntop(u32) or two-arg ntop(AF_INET, u32) — IPv4.
+      ((or (null family-literal) (eql family-literal 2))
+       `(progn
+          (whistler::store whistler::u8 ,slot-sym 0 2)
+          (whistler::store whistler::u32 ,slot-sym 1
+                           ,(lower-expr addr-expr))
+          ;; Zero the trailing 12 bytes so userspace dispatch on the
+          ;; family byte alone is safe even without re-clearing.
+          ,@(loop for off from 5 below +bt-ntop-slot-size+
+                  collect `(whistler::store whistler::u8 ,slot-sym ,off 0))))
+      (t
+       (unsupported "ntop() with non-literal family — only AF_INET/AF_INET6")))))
 
 (defun lower-map-assign (mref op rhs)
   (let* ((info (or (gethash (or (getf (cdr mref) :name) "@") *map-table*)
@@ -1842,6 +1997,30 @@
                (t (cons (walk (first f)) (walk (rest f)))))))
     (walk form)))
 
+(defun infer-ntop-vars (stmts)
+  "Return a list of var-name strings that hold an `ntop(…)' result.
+   Walks the body — including nested if/while — recording any
+   `\$v = ntop(...)' assignment (or compound update). Used to back
+   those vars with a 17-byte stack slot in the probe prologue."
+  (let ((acc nil))
+    (labels ((ntop-call-p (e)
+               (and (consp e) (eq (first e) :call)
+                    (stringp (getf (cdr e) :name))
+                    (string= (getf (cdr e) :name) "ntop")))
+             (maybe-record (lhs rhs)
+               (when (and (consp lhs) (eq (first lhs) :var)
+                          (ntop-call-p rhs))
+                 (pushnew (second lhs) acc :test #'string=)))
+             (walk (s)
+               (case (first s)
+                 (:assign (maybe-record (getf (cdr s) :lhs)
+                                        (getf (cdr s) :rhs)))
+                 (:if     (mapc #'walk (getf (cdr s) :then))
+                          (mapc #'walk (getf (cdr s) :else)))
+                 (:while  (mapc #'walk (getf (cdr s) :body))))))
+      (mapc #'walk stmts))
+    acc))
+
 (defun infer-var-types (stmts)
   "Walk STMTS for `$v = (struct X *)EXPR' (or any RHS that contains
    a cast at its outermost reachable position) and return an alist
@@ -1875,6 +2054,7 @@
   (multiple-value-bind (ptype section) (spec->section spec)
     (let* ((*probe-spec* spec)
            (*var-types*  (infer-var-types body))
+           (*ntop-vars*  (infer-ntop-vars body))
            (probe-str (format nil "~A" section))
            (func-str  (probe-func-name spec))
            (body      (rewrite-self-refs body probe-str func-str))
@@ -1886,9 +2066,22 @@
            (gated (if pred-form
                       `((when ,pred-form ,@body-forms))
                       body-forms))
+           ;; Initialise each var. ntop-typed vars get a pointer to a
+           ;; per-probe 17-byte stack slot; everything else starts 0.
+           (var-inits
+             (loop for v in vars
+                   for name = (symbol-name v)
+                   for as-bt = (and (> (length name) 1)
+                                    (char= (char name 0) #\$)
+                                    (subseq name 1))
+                   for is-ntop = (and as-bt
+                                      (member as-bt *ntop-vars*
+                                              :test #'string-equal))
+                   collect (if is-ntop
+                               `(,v (whistler::struct-alloc ,+bt-ntop-slot-size+))
+                               `(,v 0))))
            (with-vars (if vars
-                          `((let* ,(loop for v in vars collect `(,v 0))
-                              ,@gated 0))
+                          `((let* ,var-inits ,@gated 0))
                           (append gated '(0)))))
       `(whistler:defprog ,prog-name
            (:type ,ptype :section ,section :license "GPL")
