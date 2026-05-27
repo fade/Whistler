@@ -1163,6 +1163,17 @@
                   "%H:%M:%S~%")))
     (write-string (strftime-light fmt))))
 
+(defun decode-join-record (sap)
+  "Read up to 16 string slots (128 bytes each) starting at offset 8.
+   Stop at the first empty slot; print the rest space-joined."
+  (let ((parts nil))
+    (dotimes (i 16)
+      (let ((s (sap-read-string-fixed sap (+ 8 (* i 128)) 128)))
+        (cond
+          ((zerop (length s)) (return))
+          (t (push s parts)))))
+    (write-string (format nil "~{~A~^ ~}~%" (nreverse parts)))))
+
 (defun decode-cat-record (sap cat-paths-table)
   "Read the file named by the id at offset 4 and write its contents."
   (let* ((id (sap-read-u32-le sap 4))
@@ -1189,6 +1200,7 @@
         (2 (decode-clear-map-record sap map-id-table map-alist))
         (3 (decode-time-record      sap time-format-table))
         (4 (decode-cat-record       sap cat-paths-table))
+        (5 (decode-join-record      sap))
         (t nil)))
     (force-output)))
 

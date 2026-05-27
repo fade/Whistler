@@ -799,6 +799,12 @@
 (defconstant +bt-tag-clear-map+ 2)
 (defconstant +bt-tag-time+      3)
 (defconstant +bt-tag-cat+       4)
+(defconstant +bt-tag-join+      5)
+(defconstant +bt-join-argnum+   16
+  "Maximum NULL-terminated string array entries `join()' captures.
+   Matches bpftrace's default.")
+(defconstant +bt-join-argsize+  128
+  "Max bytes per join() string slot.")
 
 (defvar *printf-table* nil
   "Per-generate() list of (ID FMT-STRING ARG-TYPES) entries.
@@ -832,6 +838,8 @@
       ((string= name "time")   (lower-async-time
                                 (getf (cdr expr) :args)))
       ((string= name "cat")    (lower-async-cat
+                                (getf (cdr expr) :args)))
+      ((string= name "join")   (lower-async-join
                                 (getf (cdr expr) :args)))
       ((string= name "delete") 0)           ; lower-expr-stmt handles the real call
       ((string= name "reg")    (lower-reg-call (getf (cdr expr) :args)))
@@ -1066,6 +1074,33 @@
   "Per-generate() alist (ID . PATH). cat(PATH) registers the path
    under a unique ID; the kernel emits (tag, id) and userspace
    reads the file and dumps its contents at print-loop time.")
+
+(defun lower-async-join (args)
+  "Emit a tagged ringbuf record capturing up to +bt-join-argnum+
+   strings from a NULL-terminated argv-style pointer array. Each
+   slot is +bt-join-argsize+ bytes wide (NUL-padded); userspace
+   stops at the first empty entry and prints the rest space-joined."
+  (unless (= 1 (length args))
+    (unsupported "join() takes exactly one arg (a pointer to argv)"))
+  (let* ((ptr  (lower-expr (first args)))
+         (rec  (gensym "REC"))
+         (p    (gensym "P"))
+         (size (+ 8 (* +bt-join-argnum+ +bt-join-argsize+)))
+         (str-helper (intern "PROBE-READ-USER-STR" :whistler)))
+    `(whistler:with-ringbuf (,rec ,*print-map-name* ,size)
+       (whistler::store ,(intern "U32" :whistler) ,rec 0 ,+bt-tag-join+)
+       (whistler::store ,(intern "U32" :whistler) ,rec 4 0)
+       (let ((,p ,ptr))
+         ,@(loop for i below +bt-join-argnum+
+                 for arg-off = (+ 8 (* i +bt-join-argsize+))
+                 for ptr-tmp = (gensym "ARGV")
+                 collect `(let ((,ptr-tmp (whistler::struct-alloc 8)))
+                            (whistler::probe-read-kernel
+                             ,ptr-tmp 8 (whistler::+ ,p ,(* i 8)))
+                            (,str-helper
+                             (whistler::+ ,rec ,arg-off)
+                             ,+bt-join-argsize+
+                             (whistler::load whistler::u64 ,ptr-tmp 0))))))))
 
 (defun lower-async-cat (args)
   "Emit a tagged ringbuf record asking userspace to read and dump
