@@ -115,6 +115,7 @@
                for result = (case (tag-of inner)
                               (:probe        (norm-probe inner))
                               (:function     (norm-function inner))
+                              (:macro-decl   (norm-macro inner))
                               (:config-block nil)  ; accept-and-ignore
                               (t (error "unexpected top-form: ~S"
                                         (tag-of inner))))
@@ -129,6 +130,27 @@
                    (loop for p in (all-tagged params-node :param)
                          collect (text-of (first-tagged p :ident))))))
     (list :function
+          :name (text-of name-node)
+          :params params
+          :body (norm-block block-node))))
+
+(defun norm-macro (node)
+  "Convert a `macro NAME(params) { body }' declaration into the same
+   shape as :function so the codegen can reuse the user-fn inline
+   path. Each param is rendered as either \"$NAME\" or \"@NAME\" —
+   the leading sigil tells codegen which substitution form to use."
+  (let* ((name-node   (first-tagged node :ident))
+         (params-node (first-tagged node :macro-param-list))
+         (block-node  (first-tagged node :block))
+         (params
+           (when params-node
+             (loop for p in (all-tagged params-node :macro-param)
+                   for ident = (text-of (first-tagged p :ident))
+                   for raw   = (text-of p)
+                   collect (if (and (plusp (length raw)) (char= (char raw 0) #\@))
+                               (concatenate 'string "@" ident)
+                               ident)))))
+    (list :macro
           :name (text-of name-node)
           :params params
           :body (norm-block block-node))))

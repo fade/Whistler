@@ -171,8 +171,19 @@
 (defparameter *grammar-source*
   "
   script         = <ws> top-form (<ws> top-form)* <ws>
-  top-form       = function / config-block / probe
+  top-form       = function / macro-decl / config-block / probe
   function       = <'fn'> <ws> ident <ws> <'('> <ws> param-list? <ws> <')'> <ws> block
+  (* bpftrace `macro NAME(args) { body }' — pure inline expansion
+     at every call site. Params accept the same `$var' as `fn' plus
+     an `@map' form for map-reference parameters used by helpers
+     like `display_map(description, @map)'. *)
+  macro-decl     = <'macro'> <ws> ident <ws> <'('> <ws> macro-param-list? <ws> <')'> <ws> block
+  macro-param-list = macro-param (<ws> <','> <ws> macro-param)*
+  (* Macro params come in three flavours: `@ident' (map ref),
+     `$ident' (scalar var), or bare `ident' (also scalar — bpftrace
+     tools commonly omit the `$' on macro params and reference the
+     param by bare name in the body). *)
+  macro-param    = '@' ident / '$' ident / ident
   param-list     = param (<ws> <','> <ws> param)*
   param          = <'$'> ident
 

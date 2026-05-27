@@ -344,7 +344,15 @@
     (:int        (second expr))
     (:str        (second expr))
     (:var        (var-sym (second expr)))
-    (:builtin    (lower-builtin (second expr)))
+    (:builtin
+     ;; bpftrace allows a zero-arg `macro' to be referenced bare —
+     ;; `sysname' (no parens) means `sysname()'. If the name is a
+     ;; registered macro/fn, inline it; otherwise fall through to
+     ;; the builtin table.
+     (let ((sname (string-downcase (symbol-name (second expr)))))
+       (cond ((find-user-function sname)
+              (inline-user-call sname nil))
+             (t (lower-builtin (second expr))))))
     (:curtask    '(whistler::get-current-task))
     ;; A bare cast (no following ->) — just compute the underlying
     ;; expression. The type annotation is informational; meaningful
@@ -352,6 +360,12 @@
     ;; which lower-field handles.
     (:cast       (lower-expr (getf (cdr expr) :expr)))
     (:constant   (or (resolve-constant (second expr))
+                     ;; bpftrace allows zero-arg `macro' to be called
+                     ;; bare — `sysname' (no parens) means `sysname()'.
+                     ;; A bare lowercase ident that didn't resolve to
+                     ;; a constant may still be a registered macro.
+                     (and (find-user-function (second expr))
+                          (inline-user-call (second expr) nil))
                      (unsupported "unknown identifier `~A' — not in BTF enums or curated #define table"
                                   (second expr))))
     (:arg        (lower-arg (second expr)))
@@ -381,7 +395,12 @@
                  (rest script)))
 
 (defun script-functions (script)
-  (remove-if-not (lambda (f) (and (consp f) (eq (first f) :function)))
+  "All inlineable user definitions — :function (`fn`) and :macro
+   (`macro`). Both expand at call sites; macros additionally accept
+   `@map'-prefixed parameters."
+  (remove-if-not (lambda (f) (and (consp f)
+                                  (or (eq (first f) :function)
+                                      (eq (first f) :macro))))
                  (rest script)))
 
 (defvar *user-functions* nil
@@ -654,7 +673,10 @@
 (defun inline-user-call (name args)
   "Inline a call to user-defined function NAME. Each (:var \"param\")
    in the body is rewritten to the matching argument expression at
-   AST level, then the body is lowered as a Whistler form."
+   AST level, then the body is lowered as a Whistler form. For
+   macro params written `@name', the matching argument must itself
+   be an @-map; the body's references to `@name' are renamed (keys
+   preserved) to point at the actual map."
   (let* ((fn      (find-user-function name))
          (params  (getf fn :params))
          (body    (getf fn :body))
@@ -662,6 +684,12 @@
     (unless (= (length params) (length args))
       (unsupported "fn ~A expects ~D arg~:p, got ~D"
                    name (length params) (length args)))
+    ;; Validate @-params: matching arg must be an @-map reference.
+    (loop for (p . a) in subs
+          when (and (plusp (length p)) (char= (char p 0) #\@))
+            do (unless (and (consp a) (eq (first a) :map))
+                 (unsupported "macro ~A: param ~A wants an @-map, got ~S"
+                              name p a)))
     (let* ((body* (mapcar (lambda (s) (substitute-vars s subs)) body))
            (forms (mapcar #'lower-fn-stmt body*)))
       ;; Single trailing :return → its expression IS the result.
@@ -672,14 +700,34 @@
         (t `(progn ,@forms))))))
 
 (defun substitute-vars (form subs)
-  "Walk FORM (an AST), replacing every (:var \"name\") whose name
-   appears as a CAR in SUBS with the substitution expression."
+  "Walk FORM (an AST), substituting parameter references:
+     * `$name'  → matches (:var NAME); replaced wholesale.
+     * bare `name' (macro param without sigil) → matches both
+       (:var NAME) AND (:builtin :NAME); replaced wholesale.
+     * `@name'  → matches (:map :name NAME …); :name is rewritten to
+       the actual map's name and :keys is preserved from the body."
   (cond
     ((not (consp form)) form)
     ((and (eq (first form) :var) (stringp (second form)))
      (let ((cell (assoc (second form) subs :test #'string=)))
        (cond (cell (cdr cell))
              (t form))))
+    ;; Bare-name macro params: (:builtin :NAME) keyword form.
+    ((and (eq (first form) :builtin) (keywordp (second form)))
+     (let* ((sname (string-downcase (symbol-name (second form))))
+            (cell  (assoc sname subs :test #'string=)))
+       (cond (cell (cdr cell))
+             (t form))))
+    ((and (eq (first form) :map) (stringp (getf (cdr form) :name)))
+     (let* ((local (getf (cdr form) :name))
+            (cell  (assoc (concatenate 'string "@" local) subs
+                          :test #'string=)))
+       (if cell
+           (list :map :name (getf (cdr (cdr cell)) :name)
+                 :keys (mapcar (lambda (k) (substitute-vars k subs))
+                               (getf (cdr form) :keys)))
+           (cons (substitute-vars (first form) subs)
+                 (substitute-vars (rest form)  subs)))))
     (t (cons (substitute-vars (first form) subs)
              (substitute-vars (rest form)  subs)))))
 

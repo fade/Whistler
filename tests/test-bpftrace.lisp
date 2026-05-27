@@ -345,6 +345,37 @@
      "fn id($x) { return $x; }
       kprobe:foo { @ = id(1, 2); }")))
 
+(test parse-macro-decl
+  "`macro NAME(params) { body }' top-form parses to :macro with the
+   same shape as :function."
+  (let* ((ast (whistler/bpftrace::normalize
+               (whistler/bpftrace::parse-script
+                "macro ms($t) { return ($t * 1000); }
+                 kprobe:vfs_read { @ = ms(arg2); }"))))
+    (let ((m (find :macro (rest ast) :key #'first)))
+      (is (not (null m)))
+      (is (string= "ms" (getf (cdr m) :name)))
+      (is (equal '("t") (getf (cdr m) :params))))))
+
+(test parse-macro-bare-and-at-params
+  "Macro params accept `$name', bare `name', and `@name' forms."
+  (let* ((ast (whistler/bpftrace::normalize
+               (whistler/bpftrace::parse-script
+                "macro show(a, b, @m) { print(@m, a); }
+                 kprobe:foo { show(1, 2, @counts); }"))))
+    (let ((m (find :macro (rest ast) :key #'first)))
+      (is (equal '("a" "b" "@m") (getf (cdr m) :params))))))
+
+(test codegen-zero-arg-macro-bare-call
+  "A zero-arg `macro NAME() { … }' may be referenced bare (no parens)
+   inside a probe body — sysname etc. — and inlines correctly."
+  (let* ((src "macro one() { return 1; }
+               kprobe:vfs_read { @ = one; }")
+         (gen (whistler/bpftrace:compile-script src))
+         (text (format nil "~S" (cdddr (first (getf gen :progs))))))
+    ;; Body produced the integer 1 with no leftover identifier.
+    (is (not (search "one" text :test #'char-equal)))))
+
 (test parse-while-loop
   "while (cond) { body } parses to (:while :cond … :body …)."
   (let* ((ast (whistler/bpftrace::normalize
