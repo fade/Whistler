@@ -36,6 +36,7 @@
     ("PROBE-READ-KERNEL"    . 113)
     ("PROBE-READ-USER"      . 112)
     ("PROBE-READ-USER-STR"  . 114)
+    ("PROBE-READ-KERNEL-STR" . 115)
     ("RINGBUF-OUTPUT"       . 130)
     ("RINGBUF-RESERVE"      . 131)
     ("RINGBUF-SUBMIT"       . 132)
@@ -51,6 +52,7 @@
 (defparameter *helper-arg-counts*
   '(("PROBE-READ" . 3) ("PROBE-READ-USER" . 3) ("PROBE-READ-KERNEL" . 3)
     ("PROBE-READ-STR" . 3) ("PROBE-READ-USER-STR" . 3)
+    ("PROBE-READ-KERNEL-STR" . 3)
     ("KTIME-GET-NS" . 0) ("GET-PRANDOM-U32" . 0) ("GET-CURRENT-TASK" . 0)
     ("GET-SMP-PROCESSOR-ID" . 0) ("GET-CURRENT-CGROUP-ID" . 0)
     ("GET-CURRENT-PID-TGID" . 0) ("GET-CURRENT-UID-GID" . 0)

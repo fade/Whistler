@@ -87,3 +87,41 @@
   (signals whistler/bpftrace:bpftrace-unsupported
     (whistler/bpftrace:compile-script
      "kprobe:foo { @h = lhist(arg0, 0, 1000, 10); }")))
+
+;;; ========== printf format flags ==========
+
+(test format-printf-plain-and-percent
+  "Literal text and %% pass through unchanged."
+  (is (string= "hello %"
+               (whistler/bpftrace::format-printf "hello %%" '())))
+  (is (string= "a=42"
+               (whistler/bpftrace::format-printf "a=%d" '(42)))))
+
+(test format-printf-width-and-flags
+  "Decimal width, `-' left-align and `0' zero-pad combine correctly."
+  (is (string= "  foo"   (whistler/bpftrace::format-printf "%5s" '("foo"))))
+  (is (string= "foo  "   (whistler/bpftrace::format-printf "%-5s" '("foo"))))
+  (is (string= "00042"   (whistler/bpftrace::format-printf "%05d" '(42))))
+  (is (string= "42   "   (whistler/bpftrace::format-printf "%-5d" '(42))))
+  (is (string= "comm             /tmp/x"
+               (whistler/bpftrace::format-printf "%-16s %s" '("comm" "/tmp/x")))))
+
+(test format-printf-mixed-spec
+  "Mixed %d/%x/%s and length-modifier %lld pass."
+  (is (string= "x=ff y=255 z=hi"
+               (whistler/bpftrace::format-printf "x=%x y=%u z=%s"
+                                                 '(255 255 "hi"))))
+  (is (string= "n=-7"
+               (whistler/bpftrace::format-printf "n=%lld"
+                                                 '(#xfffffffffffffff9)))))
+
+(test codegen-printf-str-builtin
+  "printf(\"%s\", str(arg0)) emits a 64-byte slot filled by
+   bpf_probe_read_user_str."
+  (let* ((src "uprobe:/usr/lib64/libc.so.6:fopen { printf(\"%s\\n\", str(arg0)); }")
+         (gen (whistler/bpftrace:compile-script src))
+         (printf-table (getf gen :printf-table))
+         (entry (first printf-table)))
+    (is (= 1 (length printf-table)) "one printf entry")
+    (is (equal '((:string . 64)) (third entry))
+        "single :string slot of size 64")))

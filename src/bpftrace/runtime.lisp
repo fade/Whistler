@@ -581,10 +581,23 @@
   "Reinterpret a 64-bit unsigned integer as signed."
   (if (>= u (ash 1 63)) (- u (ash 1 64)) u))
 
+(defun pad-str (text width left-align-p pad-char)
+  "Pad TEXT to WIDTH using PAD-CHAR. When LEFT-ALIGN-P, pad on the right."
+  (let ((len (length text)))
+    (cond
+      ((>= len width) text)
+      (left-align-p
+       (concatenate 'string text (make-string (- width len) :initial-element pad-char)))
+      (t
+       (concatenate 'string (make-string (- width len) :initial-element pad-char) text)))))
+
 (defun format-printf (fmt args)
   "C-style printf. ARGS is a list whose entries match the printf-table's
    per-arg type list: ints come through as integers, strings come
-   through as Lisp strings. Supports %d/%i/%u/%lld/%llu/%x/%X/%p/%c/%s/%%."
+   through as Lisp strings.
+
+   Supports flags (`-' left-align, `0' zero-pad), decimal width, and
+   the conversions d/i/u/lld/llu/x/X/p/c/s/%."
   (with-output-to-string (s)
     (loop with i = 0
           with n = (length fmt)
@@ -597,20 +610,37 @@
                ((and (< (1+ i) n) (char= (char fmt (1+ i)) #\%))
                 (write-char #\% s) (incf i 2))
                (t
-                (let ((j (1+ i)))
+                (let ((j (1+ i))
+                      (left-align-p nil)
+                      (zero-pad-p   nil)
+                      (width        0))
+                  ;; Flags: - or 0
+                  (loop while (< j n)
+                        for cc = (char fmt j)
+                        do (cond
+                             ((char= cc #\-) (setf left-align-p t) (incf j))
+                             ((char= cc #\0) (setf zero-pad-p t)   (incf j))
+                             (t (loop-finish))))
+                  ;; Width
+                  (loop while (and (< j n) (digit-char-p (char fmt j)))
+                        do (setf width (+ (* width 10) (digit-char-p (char fmt j))))
+                           (incf j))
+                  ;; Length modifiers (just skip them; we treat everything as 64-bit)
                   (loop while (and (< j n) (char= (char fmt j) #\l))
                         do (incf j))
                   (when (>= j n) (write-char c s) (return))
-                  (let ((spec (char fmt j))
-                        (arg  (pop rest)))
-                    (case spec
-                      ((#\d #\i) (format s "~D" (signed-64 (or arg 0))))
-                      ((#\u)     (format s "~D" (or arg 0)))
-                      ((#\x #\p) (format s "~(~X~)" (or arg 0)))
-                      ((#\X)     (format s "~X" (or arg 0)))
-                      ((#\c)     (write-char (code-char (logand (or arg 0) #xff)) s))
-                      ((#\s)     (write-string (if (stringp arg) arg "") s))
-                      (t (write-char #\% s) (write-char spec s))))
+                  (let* ((spec (char fmt j))
+                         (arg  (pop rest))
+                         (pad  (if (and zero-pad-p (not left-align-p)) #\0 #\Space))
+                         (text (case spec
+                                 ((#\d #\i) (format nil "~D" (signed-64 (or arg 0))))
+                                 ((#\u)     (format nil "~D" (or arg 0)))
+                                 ((#\x #\p) (format nil "~(~X~)" (or arg 0)))
+                                 ((#\X)     (format nil "~X" (or arg 0)))
+                                 ((#\c)     (string (code-char (logand (or arg 0) #xff))))
+                                 ((#\s)     (if (stringp arg) arg ""))
+                                 (t         (format nil "%~C" spec)))))
+                    (write-string (pad-str text width left-align-p pad) s))
                   (setf i (1+ j))))))))
 
 (defun sap-read-string-fixed (sap offset max-len)
@@ -633,14 +663,16 @@
              (types (third entry))
              (args  (let ((off 8))
                       (loop for ty in types
-                            collect (ecase ty
-                                      (:int
+                            collect (cond
+                                      ((eq ty :int)
                                        (prog1 (sap-read-u64-le sap off)
                                          (incf off 8)))
-                                      (:string
-                                       (prog1 (sap-read-string-fixed
-                                               sap off 16)
-                                         (incf off 16))))))))
+                                      ((and (consp ty) (eq (car ty) :string))
+                                       (let ((size (cdr ty)))
+                                         (prog1 (sap-read-string-fixed
+                                                 sap off size)
+                                           (incf off size))))
+                                      (t (error "unknown printf arg type ~A" ty)))))))
         (write-string (format-printf fmt args))))))
 
 ;;; print/clear are async actions whose body runs userspace-side.

@@ -319,18 +319,19 @@
 
 (defun lower-arg (n)
   (ecase (first *probe-spec*)
-    (:kprobe
+    ((:kprobe :uprobe)
      (case n
        (0 '(whistler:pt-regs-parm1)) (1 '(whistler:pt-regs-parm2))
        (2 '(whistler:pt-regs-parm3)) (3 '(whistler:pt-regs-parm4))
        (4 '(whistler:pt-regs-parm5)) (5 '(whistler:pt-regs-parm6))
        (t (unsupported "arg~D — only arg0..arg5 are wired up" n))))
-    (:kretprobe (unsupported "arg~D in kretprobe — retval is the only accessor" n))
+    ((:kretprobe :uretprobe)
+     (unsupported "arg~D in ret-probe — retval is the only accessor" n))
     (:tracepoint (unsupported "tracepoint arg~D — use args->field" n))))
 
 (defun lower-retval ()
   (ecase (first *probe-spec*)
-    (:kretprobe '(whistler:pt-regs-ret))))
+    ((:kretprobe :uretprobe) '(whistler:pt-regs-ret))))
 
 (defun lower-bin (expr)
   (let ((op  (getf (cdr expr) :op))
@@ -465,15 +466,35 @@
 (defconstant +bt-comm-len+ 16
   "Bytes of `comm' the kernel writes via bpf_get_current_comm.")
 
+(defconstant +bt-str-default-len+ 64
+  "Default buffer size used by str(ptr) — matches bpftrace's default.")
+
+(defun str-call-p (expr)
+  "T when EXPR is a (:call :name \"str\" :args …) form."
+  (and (consp expr)
+       (eq (first expr) :call)
+       (let ((n (getf (cdr expr) :name)))
+         (and (stringp n) (string= n "str")))))
+
 (defun printf-arg-type (expr)
-  "Classify a printf arg as :int (8 bytes, u64 in record) or :string
-   (16 bytes inline). Phase 3 only knows about `comm' as a string."
-  (case (first expr)
-    (:comm :string)
-    (t     :int)))
+  "Classify a printf arg as :int (8 bytes, u64 in record), or
+   (:string . SIZE) for inline string slots. Recognises `comm' (16
+   bytes) and `str(ptr [, n])' (n bytes, default +bt-str-default-len+)."
+  (cond
+    ((eq (first expr) :comm)
+     (cons :string +bt-comm-len+))
+    ((str-call-p expr)
+     (let* ((args (getf (cdr expr) :args))
+            (n    (when (and (cdr args) (eq (first (second args)) :int))
+                    (second (second args)))))
+       (cons :string (or n +bt-str-default-len+))))
+    (t :int)))
 
 (defun printf-arg-size (arg-type)
-  (ecase arg-type (:int 8) (:string +bt-comm-len+)))
+  (cond
+    ((eq arg-type :int) 8)
+    ((and (consp arg-type) (eq (car arg-type) :string)) (cdr arg-type))
+    (t (error "printf-arg-size: unrecognised ~A" arg-type))))
 
 (defun lower-printf (args)
   "Lower a bpftrace `printf(\"FMT\", arg…)` to a ringbuf-submit using
@@ -511,16 +532,36 @@
          ,@(loop for arg in extra-args
                  for ty  in arg-types
                  for off in offsets
-                 collect (ecase ty
-                           (:int
-                            `(whistler::store ,(intern "U64" :whistler)
-                                              ,rec ,off ,(lower-expr arg)))
-                           (:string
-                            ;; `comm' is the only string source today.
-                            ;; bpf_get_current_comm(rec + off, 16) fills
-                            ;; the 16-byte slot directly.
-                            `(whistler::get-current-comm
-                              (+ ,rec ,off) ,+bt-comm-len+))))))))
+                 collect (lower-printf-arg arg ty rec off))))))
+
+(defun lower-printf-arg (arg ty rec off)
+  "Emit the kernel-side store that fills RECORD slot at OFFSET with ARG.
+   TY is :int or (:string . SIZE)."
+  (cond
+    ((eq ty :int)
+     `(whistler::store ,(intern "U64" :whistler) ,rec ,off ,(lower-expr arg)))
+    ((and (consp ty) (eq (car ty) :string))
+     (let ((size (cdr ty)))
+       (cond
+         ;; `comm' — bpf_get_current_comm fills the slot directly.
+         ((eq (first arg) :comm)
+          `(whistler::get-current-comm (+ ,rec ,off) ,size))
+         ;; `str(ptr)' / `str(ptr, n)' — pick the helper by probe type.
+         ((str-call-p arg)
+          (let* ((args (getf (cdr arg) :args))
+                 (ptr  (lower-expr (first args)))
+                 (helper (str-helper-for-probe)))
+            `(,helper (+ ,rec ,off) ,size ,ptr))))))))
+
+(defun str-helper-for-probe ()
+  "Which probe_read_*_str helper str() resolves to. bpftrace defaults
+   to bpf_probe_read_user_str — covers uprobe args, tracepoint
+   `filename'/`pathname' (which point to user memory even though the
+   tracepoint is in-kernel), and pt_regs args in kprobes that were
+   themselves passed user pointers. A separate kstr() builtin can
+   cover the rare kernel-string case."
+  (declare (ignorable *probe-spec*))
+  (intern "PROBE-READ-USER-STR" :whistler))
 
 (defun lower-field (expr)
   (let ((base (getf (cdr expr) :base))
