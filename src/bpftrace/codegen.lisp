@@ -429,9 +429,10 @@
               tbl))))
 
 (defun resolve-constant (name)
-  "Look NAME up in the BTF + curated constants table. Returns the
-   integer value or NIL."
-  (gethash name (constants-table)))
+  "Look NAME up in (1) the script's own #define directives, then
+   (2) BTF enums + the curated table. Returns the integer value or NIL."
+  (or (cdr (assoc name *user-cpp-defines* :test #'string=))
+      (gethash name (constants-table))))
 
 (defun lower-builtin (kw)
   (case kw

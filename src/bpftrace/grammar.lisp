@@ -19,6 +19,108 @@
 
 (in-package #:whistler/bpftrace)
 
+;;; ========== Minimal preprocessor ==========
+;;;
+;;; bpftrace's tools commonly start with #include directives + a
+;;; conditional like
+;;;   #ifndef BPFTRACE_HAVE_BTF
+;;;   #include <linux/socket.h>
+;;;   #else
+;;;   #define AF_INET 2
+;;;   #endif
+;;; We always have BTF, so the BTF branch wins. We do NOT parse the
+;;; C headers — the structs they declare are resolved against the
+;;; kernel's BTF at codegen time. The handful of #define constants
+;;; users write inline get harvested into *user-cpp-defines*.
+
+(defvar *user-cpp-defines* nil
+  "Per-parse alist NAME → integer from user #define directives.
+   Consulted by lower-expr's :constant case after the BTF-enum +
+   curated tables. Reset on each parse-script call.")
+
+(defun cpp-preprocess (source)
+  "Strip C-style preprocessor directives bpftrace tools rely on:
+
+     #include <…>            silently dropped
+     #include \"…\"          silently dropped
+     #define NAME INT_LIT    interned into *user-cpp-defines*
+     #ifndef BPFTRACE_HAVE_BTF
+     …
+     #else
+     …
+     #endif                  the #else branch is kept
+
+   Anything more complex (function-like macros, expression #if,
+   multi-level nesting) is out of scope — write the constant inline."
+  (setf *user-cpp-defines* nil)
+  (with-output-to-string (out)
+    (let ((skip-depth 0))
+      (with-input-from-string (in source)
+        (loop for line = (read-line in nil nil)
+              while line
+              for trim = (string-left-trim '(#\Space #\Tab) line)
+              do (cond
+                   ((and (>= (length trim) 2)
+                         (string= (subseq trim 0 2) "#!"))
+                    ;; #!/usr/bin/env bpftrace shebang — drop.
+                    (write-char #\Newline out))
+                   ((directive-p trim "#include")
+                    (write-char #\Newline out))
+                   ((directive-p trim "#define")
+                    (intern-cpp-define trim)
+                    (write-char #\Newline out))
+                   ((directive-p trim "#ifndef BPFTRACE_HAVE_BTF")
+                    ;; Always have BTF — skip the no-BTF branch.
+                    (setf skip-depth 1)
+                    (write-char #\Newline out))
+                   ((directive-p trim "#ifdef BPFTRACE_HAVE_BTF")
+                    ;; Always have BTF — keep this branch as-is.
+                    (write-char #\Newline out))
+                   ((directive-p trim "#else")
+                    (setf skip-depth (if (zerop skip-depth) 1 0))
+                    (write-char #\Newline out))
+                   ((directive-p trim "#endif")
+                    (setf skip-depth 0)
+                    (write-char #\Newline out))
+                   ((zerop skip-depth)
+                    (write-line line out))
+                   (t
+                    (write-char #\Newline out))))))))
+
+(defun directive-p (line prefix)
+  (and (>= (length line) (length prefix))
+       (string= (subseq line 0 (length prefix)) prefix)
+       (or (= (length line) (length prefix))
+           (let ((c (char line (length prefix))))
+             (or (char= c #\Space) (char= c #\Tab))))))
+
+(defun intern-cpp-define (line)
+  "Parse `#define NAME VALUE' where VALUE is an integer literal
+   (decimal, 0xHEX, octal-with-leading-zero, or parenthesised).
+   Quietly ignore anything more elaborate."
+  (let* ((rest (string-left-trim '(#\Space #\Tab) (subseq line 7)))  ; after "#define"
+         (sp   (position-if (lambda (c) (or (char= c #\Space) (char= c #\Tab))) rest)))
+    (when sp
+      (let* ((name (subseq rest 0 sp))
+             (val-str (string-trim '(#\Space #\Tab #\( #\))
+                                   (subseq rest (1+ sp))))
+             (val (parse-cpp-int val-str)))
+        (when (and (plusp (length name)) val)
+          (push (cons name val) *user-cpp-defines*))))))
+
+(defun parse-cpp-int (s)
+  "Try to read S as an integer literal. Returns the value or NIL."
+  (handler-case
+      (cond
+        ((and (>= (length s) 2)
+              (string= (subseq s 0 2) "0x"))
+         (parse-integer s :start 2 :radix 16 :junk-allowed t))
+        ((and (>= (length s) 2)
+              (string= (subseq s 0 2) "0X"))
+         (parse-integer s :start 2 :radix 16 :junk-allowed t))
+        (t (parse-integer s :junk-allowed t)))
+    (error () nil)))
+
 ;;; ========== Comment stripping ==========
 
 (defun strip-comments (source)
@@ -184,7 +286,8 @@
 (defun parse-script (source)
   "Parse SOURCE (a bpftrace script string) and return the raw iparse tree.
    Signals BPFTRACE-PARSE-ERROR on failure."
-  (let* ((clean (strip-comments source))
+  (let* ((preprocessed (cpp-preprocess source))
+         (clean (strip-comments preprocessed))
          (result (let ((iparse:*signal-errors* nil))
                    (iparse:parse (ensure-parser) clean))))
     (when (iparse:parse-failure-p result)

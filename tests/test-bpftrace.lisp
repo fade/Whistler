@@ -386,3 +386,34 @@
          (pred  (getf (cdr probe) :predicate)))
     (is (eq :&& (getf (cdr pred) :op))
         "top-level operator is AND")))
+
+(test cpp-preprocessor-strips-include-and-shebang
+  "#!shebang and #include lines disappear; #define lands in
+   *user-cpp-defines* and resolves through resolve-constant."
+  (let* ((src (format nil "~A~%~A~%~A~%~A~%~A~%~A~%~A"
+                      "#!/usr/bin/env bpftrace"
+                      "#include <linux/sched.h>"
+                      "#ifndef BPFTRACE_HAVE_BTF"
+                      "#include <linux/socket.h>"
+                      "#else"
+                      "#define MY_FAMILY 2"
+                      "#endif"))
+         (preprocessed (whistler/bpftrace::cpp-preprocess src)))
+    (is (not (search "#!" preprocessed)))
+    (is (not (search "#include" preprocessed)))
+    (is (equal 2 (cdr (assoc "MY_FAMILY"
+                              whistler/bpftrace::*user-cpp-defines*
+                              :test #'string=))))))
+
+(test cpp-preprocessor-keeps-btf-branch
+  "#ifndef BPFTRACE_HAVE_BTF/#else/#endif keeps the BTF (else) branch."
+  (let* ((src (format nil "~A~%~A~%~A~%~A~%~A~%~A"
+                      "#ifndef BPFTRACE_HAVE_BTF"
+                      "should_be_skipped"
+                      "#else"
+                      "should_be_kept"
+                      "#endif"
+                      ""))
+         (preprocessed (whistler/bpftrace::cpp-preprocess src)))
+    (is (search "should_be_kept" preprocessed))
+    (is (not (search "should_be_skipped" preprocessed)))))
