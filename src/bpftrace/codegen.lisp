@@ -258,6 +258,14 @@
                             (minfo-value-size info)
                             (max (minfo-value-size info) need
                                  +bt-func-name-key-len+))))
+                   ;; `@m[k] = comm' — store the current task's
+                   ;; TASK_COMM_LEN-byte name. Same string-slot
+                   ;; machinery as the :str case.
+                   ((and (consp rhs) (eq (first rhs) :comm))
+                    (setf (minfo-kind info) :scalar
+                          (minfo-value-string-p info) t
+                          (minfo-value-size info)
+                          (max (minfo-value-size info) +bt-comm-len+)))
                    ((and (consp rhs) (eq (first rhs) :call))
                     (let ((fn (getf (cdr rhs) :name)))
                       (cond
@@ -374,6 +382,11 @@
   "Per-probe alist VAR-NAME → STRUCT-NAME. Populated from `$v =
    (struct X *)EXPR' assignments so later `$v.field' accesses can
    walk BTF for the right offsets without seeing the cast again.")
+
+(defvar *tuple-vars* nil
+  "Per-probe alist VAR-NAME → list-of-component-AST-nodes. Populated
+   from `\$v = (e1, e2, …)' assignments so later \`@m[\$v]' accesses
+   can expand into composite-key form \`@m[e1, e2, …]'.")
 
 (defvar *ntop-vars* nil
   "Per-probe list of VAR-NAME strings whose value comes from `ntop(…)'.
@@ -921,16 +934,14 @@
     addr))
 
 (defun lower-has-key-call (args)
-  "Lower `has_key(@map, key)' to 1 if `bpf_map_lookup_elem' returns a
-   non-null pointer, 0 otherwise. We can't reuse `getmap' here — it
-   dereferences scalar-valued maps, conflating `key present with
-   value 0' and `key absent'. We emit `map-lookup-ptr' (composite key)
-   or `map-lookup' on a stack-allocated key (scalar) and check the
-   raw pointer."
-  (unless (= (length args) 2)
-    (unsupported "has_key needs exactly (@map, key)"))
+  "Lower `has_key(@map, key…)' to 1 if `bpf_map_lookup_elem' returns
+   a non-null pointer, 0 otherwise. Accepts one or more key arguments
+   — composite keys (`has_key(@m, k1, k2)') flow through the same
+   struct-key path as @m[k1, k2] reads."
+  (unless (>= (length args) 2)
+    (unsupported "has_key needs at least (@map, key)"))
   (let* ((mref (first args))
-         (key  (second args)))
+         (keys (rest args)))
     (unless (and (consp mref) (eq (first mref) :map))
       (unsupported "has_key first arg must be a @map reference"))
     (let* ((mname-string (getf (cdr mref) :name))
@@ -939,17 +950,14 @@
            (mname (minfo-name info))
            (p     (gensym "P"))
            (k     (gensym "K"))
-           (ptr-p (keys-need-ptr-ops-p (list key))))
+           (ptr-p (keys-need-ptr-ops-p keys)))
       (cond
         (ptr-p
-         ;; Composite / wide key: with-key gives us a pointer directly.
-         (with-key (list key)
+         (with-key keys
            (lambda (kp)
              `(whistler::if (whistler::map-lookup-ptr ,mname ,kp) 1 0))))
         (t
-         ;; Scalar key: stack-allocate a u64 slot, store the key, look
-         ;; up via map-lookup (which takes a key pointer).
-         `(let* ((,k whistler::u64 ,(lower-expr key)))
+         `(let* ((,k whistler::u64 ,(lower-expr (first keys))))
             (whistler::if (whistler::map-lookup ,mname ,k) 1 0)))))))
 
 (defun lower-reg-call (args)
@@ -1819,7 +1827,34 @@
       ((and (consp rhs) (eq (first rhs) :str)
             (minfo-value-string-p info))
        (gen-string-set info keys (second rhs)))
+      ;; `@m[k] = comm' — stash bpf_get_current_comm() into the value
+      ;; slot. The map's value-size was set to TASK_COMM_LEN at
+      ;; inference time.
+      ((and (consp rhs) (eq (first rhs) :comm)
+            (minfo-value-string-p info))
+       (gen-comm-set info keys))
       (t (gen-scalar-set mname keys (lower-expr rhs) op)))))
+
+(defun gen-comm-set (info keys)
+  "Store the current task's TASK_COMM_LEN bytes as @MNAME[KEYS]'s
+   value. Uses bpf_get_current_comm into a stack-allocated buffer
+   then map_update_elem."
+  (let* ((mname (minfo-name info))
+         (vsize (minfo-value-size info))
+         (buf   (gensym "VBUF"))
+         (tmpk  (gensym "K"))
+         (ptr-p (keys-need-ptr-ops-p keys)))
+    (with-key keys
+      (lambda (k)
+        (if ptr-p
+            `(let ((,buf (whistler::struct-alloc ,vsize)))
+               (whistler::get-current-comm ,buf ,vsize)
+               (whistler::map-update-ptr ,mname ,k ,buf 0))
+            `(let* ((,tmpk whistler::u64 ,k)
+                    (,buf (whistler::struct-alloc ,vsize)))
+               (whistler::get-current-comm ,buf ,vsize)
+               (whistler::map-update-ptr
+                ,mname (whistler::stack-addr ,tmpk) ,buf 0)))))))
 
 (defun gen-string-set (info keys literal)
   "Store LITERAL as the NUL-padded contents of @MNAME[KEYS]. The map
@@ -2172,6 +2207,110 @@
                (t (cons (walk (first f)) (walk (rest f)))))))
     (walk form)))
 
+(defun infer-tuple-vars (stmts)
+  "Walk STMTS for `\$v = (e1, e2, …)' assignments and return an
+   alist mapping VAR-NAME → COMPONENT-LIST. Used to expand
+   later \`@m[\$v]' references into composite-key form."
+  (let ((acc nil))
+    (labels ((maybe-record (lhs rhs)
+               (when (and (consp lhs) (eq (first lhs) :var)
+                          (consp rhs) (eq (first rhs) :tuple))
+                 (push (cons (second lhs) (getf (cdr rhs) :items)) acc)))
+             (walk (s)
+               (case (first s)
+                 (:assign (maybe-record (getf (cdr s) :lhs)
+                                        (getf (cdr s) :rhs)))
+                 (:if     (mapc #'walk (getf (cdr s) :then))
+                          (mapc #'walk (getf (cdr s) :else)))
+                 (:while  (mapc #'walk (getf (cdr s) :body))))))
+      (mapc #'walk stmts))
+    acc))
+
+(defun expand-tuple-vars-script (script)
+  "Apply expand-tuple-vars per probe (each has its own *tuple-vars*).
+   Returns a new script with all `\$v = (e1, e2, …)' uses inlined
+   to composite-key form."
+  (cons (first script)
+        (mapcar
+         (lambda (form)
+           (cond
+             ((and (consp form) (eq (first form) :probe))
+              (let* ((body (getf (cdr form) :body))
+                     (pred (getf (cdr form) :predicate))
+                     (*tuple-vars* (infer-tuple-vars body))
+                     (body* (expand-tuple-vars body))
+                     (pred* (when pred (expand-tuple-vars pred))))
+                (loop for (k v) on (cdr form) by #'cddr
+                      append (list k (cond ((eq k :body) body*)
+                                           ((eq k :predicate) pred*)
+                                           (t v)))
+                        into rest
+                      finally (return (cons :probe rest)))))
+             (t form)))
+         (rest script))))
+
+(defun drop-tuple-assignments (stmts)
+  "Drop \`\$v = (:tuple …)' statements from a body — the var is
+   implicit (callers reach the components directly via expand-tuple-vars)."
+  (mapcar
+   (lambda (s)
+     (cond
+       ((and (eq (first s) :assign)
+             (let ((rhs (getf (cdr s) :rhs)))
+               (and (consp rhs) (eq (first rhs) :tuple))))
+        '(:let-noop))
+       ((eq (first s) :if)
+        (list :if
+              :cond (getf (cdr s) :cond)
+              :then (drop-tuple-assignments (getf (cdr s) :then))
+              :else (drop-tuple-assignments (getf (cdr s) :else))))
+       ((eq (first s) :while)
+        (list :while
+              :cond (getf (cdr s) :cond)
+              :body (drop-tuple-assignments (getf (cdr s) :body))))
+       (t s)))
+   stmts))
+
+(defun expand-tuple-vars (form)
+  "Substitute tuple-var references in @m[\$v] / delete(@m, \$v) /
+   has_key(@m, \$v) shapes — replace \$v with its component list.
+   Also flattens any inline `(:tuple :items …)' literal that appears
+   in those same key positions, so `has_key(@m, (a, b))' becomes
+   `has_key(@m, a, b)' without a name detour."
+  (labels ((tuple-items (k)
+             (cond
+               ((and (consp k) (eq (first k) :var))
+                (cdr (assoc (second k) *tuple-vars* :test #'string=)))
+               ((and (consp k) (eq (first k) :tuple))
+                (getf (cdr k) :items))))
+           (expand-keys (keys)
+             (mapcan (lambda (k)
+                       (or (tuple-items k) (list k)))
+                     keys))
+           (walk (f)
+             (cond
+               ((not (consp f)) f)
+               ;; @m[ keys ] — flatten tuple-var key into components.
+               ((and (eq (first f) :map) (getf (cdr f) :keys))
+                (loop for (k v) on (cdr f) by #'cddr
+                      append (list k (cond ((eq k :keys) (expand-keys v))
+                                           (t v)))
+                        into rest
+                      finally (return (cons :map rest))))
+               ;; delete(@m, $v[, …]) / has_key(@m, $v) — keys are in
+               ;; positional args 1+.
+               ((and (eq (first f) :call)
+                     (member (getf (cdr f) :name) '("delete" "has_key")
+                             :test #'string=))
+                (let* ((args (getf (cdr f) :args))
+                       (head (first args))
+                       (rest (rest args)))
+                  (list :call
+                        :name (getf (cdr f) :name)
+                        :args (cons (walk head) (expand-keys rest)))))
+               (t (cons (walk (first f)) (walk (rest f)))))))
+    (walk form)))
+
 (defun infer-ntop-vars (stmts)
   "Return a list of var-name strings that hold an `ntop(…)' result.
    Walks the body — including nested if/while — recording any
@@ -2237,10 +2376,14 @@
     (let* ((*probe-spec* spec)
            (*var-types*  (infer-var-types body))
            (*ntop-vars*  (infer-ntop-vars body))
+           (*tuple-vars* (infer-tuple-vars body))
            (probe-str (format nil "~A" section))
            (func-str  (probe-func-name spec))
            (body      (rewrite-self-refs body probe-str func-str))
            (pred      (when pred (rewrite-self-refs pred probe-str func-str)))
+           (body      (expand-tuple-vars body))
+           (body      (drop-tuple-assignments body))
+           (pred      (when pred (expand-tuple-vars pred)))
            (prog-name (intern (format nil "BT-PROBE-~D-~D" index sub) :whistler))
            (vars      (collect-vars body))
            (body-forms (lower-stmts body))
@@ -2410,6 +2553,10 @@
          (*user-functions* (loop for fn in (script-functions script)
                                  collect (cons (getf (cdr fn) :name)
                                                (cdr fn))))
+         ;; Expand tuple-var references BEFORE infer-maps so the map's
+         ;; key-size lands at the composite total, not at 8 (the size
+         ;; of the var alias).
+         (script    (expand-tuple-vars-script script))
          (map-table (infer-maps script))
          (*map-table* map-table)
          (maps      (loop for info being the hash-values of map-table

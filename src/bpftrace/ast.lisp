@@ -447,6 +447,13 @@
       (:constant     (list :constant
                            (text-of (first-tagged inner :ident))))
       (:string-lit   (list :str (strip-quotes (text-of inner))))
+      (:tuple
+       (list :tuple
+             :items (mapcar #'norm-expr-or-expr-wrapped
+                            (remove-if-not
+                             (lambda (c)
+                               (and (consp c) (not (eq (tag-of c) :ident))))
+                             (children-of inner)))))
       (:hex-int      (list :int (parse-integer (text-of inner) :start 2 :radix 16)))
       (:integer      (list :int (parse-integer-with-exp (text-of inner))))
       (t (error "unexpected primary: ~S" inner)))))

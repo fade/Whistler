@@ -273,8 +273,13 @@
   arrow-access   = <'->'> ident
   index-access   = <'['> <ws> expr (<ws> <','> <ws> expr)* <ws> <']'>
 
-  primary        = cast / primitive-cast / parens / func-call / map-access / scalar-var / builtin /
+  primary        = cast / primitive-cast / tuple / parens / func-call / map-access / scalar-var / builtin /
                    constant / string-lit / hex-int / integer
+  (* `(e1, e2, …)' — bpftrace tuple literal. Always 2+ elements so
+     it doesn't conflict with the parenthesised single expression
+     form. Components must be simple (pure) — biosnoop uses them as
+     composite map keys: \$key = (args.dev, args.sector). *)
+  tuple          = <'('> <ws> expr (<ws> <','> <ws> expr)+ <ws> <')'>
   (* C-style struct-pointer cast: open-paren struct ident asterisk
      close-paren expr. Must precede `parens' in the alternates so the
      open-paren disambiguation tries the cast shape first. The cast
