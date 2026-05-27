@@ -211,7 +211,10 @@
   predicate      = <'/'> <ws> expr <ws> <'/'>
 
   block          = <'{'> <ws> statements? <ws> <'}'>
-  statements     = statement (<ws> <';'> <ws> statement)* (<ws> <';'>)?
+  (* Statements are separated by `;', but bpftrace tools commonly
+     elide it after compound statements (if/while/block), so the
+     separator is optional. *)
+  statements     = statement (<ws> (<';'> <ws>)? statement)* (<ws> <';'>)?
   statement      = if-stmt / while-stmt / let-stmt / return-stmt / assign-stmt / expr-stmt
   return-stmt    = <'return'> !ident-char <ws> expr?
   while-stmt     = <'while'> !ident-char <ws> <'('> <ws> expr <ws> <')'> <ws> block
@@ -219,7 +222,8 @@
      For us the bare decl is a no-op (variables are inferred from
      use); the assigning form becomes a regular :assign. *)
   let-stmt       = <'let'> !ident-char <ws> <'$'> ident (<ws> <'='> <ws> expr)?
-  if-stmt        = <'if'> <ws> <'('> <ws> expr <ws> <')'> <ws> block (<ws> <'else'> <ws> block)?
+  if-stmt        = <'if'> <ws> if-cond <ws> block (<ws> <'else'> <ws> block)?
+  if-cond        = <'('> <ws> expr <ws> <')'> / expr
   assign-stmt    = lhs <ws> assign-op <ws> expr  /
                    lhs <ws> incdec-op
   expr-stmt      = expr
@@ -241,7 +245,9 @@
   add            = mul (<ws> ('+' / '-') <ws> mul)*
   mul            = unary (<ws> ('*' / '/' / '%') <ws> unary)*
   unary          = unary-op <ws> unary / postfix
-  unary-op       = '!' / '-' / '~'
+  (* `*EXPR' is a u64 pointer dereference — common in tools that
+     read kernel global symbols, e.g. *kaddr(\"avenrun\"). *)
+  unary-op       = '!' / '-' / '~' / '*'
 
   postfix        = primary postfix-tail*
   postfix-tail   = field-access / arrow-access / index-access
@@ -282,9 +288,10 @@
                    'arg5' / 'arg6' / 'arg7' / 'arg8' / 'arg9'
 
   ident          = #'[A-Za-z_][A-Za-z0-9_]*'
-  (* `glob-ident' is `ident' that also accepts `*' anywhere — used
-     for wildcard probe targets like `kprobe:tcp_*'. *)
-  glob-ident     = #'[A-Za-z_*][A-Za-z0-9_*]*'
+  (* `glob-ident' is `ident' that also accepts `*' and `.' anywhere
+     — used for wildcard probe targets like `kprobe:tcp_*' or
+     `kprobe:lookup_fast.constprop.*'. *)
+  glob-ident     = #'[A-Za-z_*][A-Za-z0-9_*.]*'
   <ident-char>   = #'[A-Za-z0-9_]'
   string-lit     = #'\"([^\"\\\\]|\\\\.)*\"'
   hex-int        = #'0[xX][0-9A-Fa-f]+'

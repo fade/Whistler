@@ -294,12 +294,21 @@
               (:expr
                (let ((e (second stmt)))
                  (when (and (consp e) (eq (first e) :call)
-                            (or (string= (getf (cdr e) :name) "delete")
-                                (string= (getf (cdr e) :name) "clear")
-                                (string= (getf (cdr e) :name) "zero"))
-                            (consp (first (getf (cdr e) :args)))
-                            (eq (first (first (getf (cdr e) :args))) :map))
-                   (note-keys (first (getf (cdr e) :args))))))))))
+                            (member (getf (cdr e) :name)
+                                    '("delete" "clear" "zero")
+                                    :test #'string=))
+                   (let* ((args (getf (cdr e) :args))
+                          (mref (first args)))
+                     (when (and (consp mref) (eq (first mref) :map))
+                       (cond
+                         ;; Two-arg delete(@m, k1[, k2 …]) — note the
+                         ;; remaining args as keys.
+                         ((and (string= (getf (cdr e) :name) "delete")
+                               (>= (length args) 2))
+                          (note-keys
+                           (list :map :name (getf (cdr mref) :name)
+                                 :keys (rest args))))
+                         (t (note-keys mref))))))))))))
       ;; Histogram maps with no explicit user key always have 4-byte key.
       (loop for info being the hash-values of table
             when (or (eq (minfo-kind info) :hist)
@@ -565,7 +574,14 @@
     (ecase op
       (:!  `(whistler::if ,arg 0 1))
       (:-  `(whistler::- 0 ,arg))
-      (:~  `(whistler::logxor ,arg #xffffffffffffffff)))))
+      (:~  `(whistler::logxor ,arg #xffffffffffffffff))
+      ;; *EXPR — u64 pointer deref via bpf_probe_read_kernel into a
+      ;; stack slot; matches bpftrace's *kaddr(SYM) pattern.
+      (:*
+       (let ((scratch (gensym "DEREF")))
+         `(let ((,scratch (whistler::struct-alloc 8)))
+            (whistler::probe-read-kernel ,scratch 8 ,arg)
+            (whistler::load ,(intern "U64" :whistler) ,scratch 0)))))))
 
 (defun lower-tern (expr)
   `(whistler::if ,(lower-expr (getf (cdr expr) :cond))
@@ -628,6 +644,7 @@
                                 (getf (cdr expr) :args)))
       ((string= name "delete") 0)           ; lower-expr-stmt handles the real call
       ((string= name "reg")    (lower-reg-call (getf (cdr expr) :args)))
+      ((string= name "kaddr")  (lower-kaddr-call (getf (cdr expr) :args)))
       ;; User-defined `fn' — inline the body, substituting the
       ;; formal parameters with the actual argument expressions.
       ((find-user-function name)
@@ -691,6 +708,46 @@
     ("di" . :di) ("rdi" . :di) ("edi" . :di)
     ("r8"  . :r8)  ("r9"  . :r9)  ("r10" . :r10) ("r11" . :r11)
     ("r12" . :r12) ("r13" . :r13) ("r14" . :r14) ("r15" . :r15)))
+
+(defvar *kallsyms-addr-cache* nil
+  "Lazy hash-table NAME → ADDR built from /proc/kallsyms. NIL until
+   the first kaddr() call asks for one.")
+
+(defun load-kallsyms-addrs ()
+  (let ((tbl (make-hash-table :test 'equal)))
+    (handler-case
+        (with-open-file (s "/proc/kallsyms" :direction :input)
+          (loop for line = (read-line s nil nil)
+                while line
+                for sp1 = (position #\Space line)
+                for sp2 = (and sp1 (position #\Space line :start (1+ sp1)))
+                when (and sp1 sp2)
+                  do (let* ((addr (parse-integer line :end sp1 :radix 16
+                                                       :junk-allowed t))
+                            (tail (subseq line (1+ sp2)))
+                            (sp3 (position #\Space tail))
+                            (name (if sp3 (subseq tail 0 sp3) tail)))
+                       (when (and addr (plusp addr) (plusp (length name)))
+                         (setf (gethash name tbl) addr)))))
+      (error () nil))
+    tbl))
+
+(defun lower-kaddr-call (args)
+  "Lower kaddr(\"name\") to the integer address of kernel symbol NAME,
+   looked up in /proc/kallsyms at compile time. Requires the lookup
+   to succeed — running without root or with kptr_restrict typically
+   gives back zeroed addresses and we fail with a clear message."
+  (unless (and args (= (length args) 1) (eq (first (first args)) :str))
+    (unsupported "kaddr() needs exactly one string-literal argument"))
+  (unless *kallsyms-addr-cache*
+    (setf *kallsyms-addr-cache* (load-kallsyms-addrs)))
+  (let* ((name (second (first args)))
+         (addr (gethash name *kallsyms-addr-cache*)))
+    (unless addr
+      (unsupported "kaddr(~S) — symbol not found in /proc/kallsyms ~
+                    (need CAP_SYS_ADMIN to see non-zero addresses)"
+                   name))
+    addr))
 
 (defun lower-reg-call (args)
   "Lower reg(\"name\") to a (ctx u64 OFFSET) load against pt_regs."
@@ -1377,11 +1434,18 @@
     (cond
       ((and (consp e) (eq (first e) :call)
             (string= (getf (cdr e) :name) "delete"))
-       (let* ((arg (first (getf (cdr e) :args)))
-              (info (or (gethash (or (getf (cdr arg) :name) "@") *map-table*)
+       ;; Two forms:
+       ;;   delete(@m[k])    -- one arg, the map-access
+       ;;   delete(@m, k)    -- two args, map ref + key (newer bpftrace)
+       (let* ((args (getf (cdr e) :args))
+              (mref (first args))
+              (keys (cond
+                      ((= (length args) 1)         (getf (cdr mref) :keys))
+                      ((>= (length args) 2)        (rest args))))
+              (info (or (gethash (or (getf (cdr mref) :name) "@") *map-table*)
                         (error "internal: delete of unknown @map")))
               (mname (minfo-name info)))
-         (with-key (getf (cdr arg) :keys)
+         (with-key keys
            (lambda (k) `(whistler:remmap ,mname ,k)))))
       ;; zero() — kernel-side no-op; Phase 3 just skips it.
       ((and (consp e) (eq (first e) :call)
