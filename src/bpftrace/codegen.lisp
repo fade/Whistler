@@ -966,23 +966,45 @@
    the first kaddr() call asks for one.")
 
 (defun load-kallsyms-addrs ()
-  (let ((tbl (make-hash-table :test 'equal)))
-    (handler-case
-        (with-open-file (s "/proc/kallsyms" :direction :input)
-          (loop for line = (read-line s nil nil)
-                while line
-                for sp1 = (position #\Space line)
-                for sp2 = (and sp1 (position #\Space line :start (1+ sp1)))
-                when (and sp1 sp2)
-                  do (let* ((addr (parse-integer line :end sp1 :radix 16
-                                                       :junk-allowed t))
-                            (tail (subseq line (1+ sp2)))
-                            (sp3 (position #\Space tail))
-                            (name (if sp3 (subseq tail 0 sp3) tail)))
-                       (when (and addr (plusp addr) (plusp (length name)))
-                         (setf (gethash name tbl) addr)))))
-      (error () nil))
-    tbl))
+  "Build NAME → ADDR from /proc/kallsyms. When kptr_restrict zeros
+   the table for unprivileged readers, fall back to the readable
+   /boot/System.map-<uname-r> file. System.map carries the same
+   absolute symbol addresses as the loaded kernel image (modulo
+   KASLR), so kaddr() resolves correctly on systems without
+   CAP_SYS_ADMIN at compile time."
+  (labels ((parse-stream (s)
+             (loop with tbl = (make-hash-table :test 'equal)
+                   for line = (read-line s nil nil)
+                   while line
+                   for sp1 = (position #\Space line)
+                   for sp2 = (and sp1 (position #\Space line :start (1+ sp1)))
+                   when (and sp1 sp2)
+                     do (let* ((addr (parse-integer line :end sp1 :radix 16
+                                                          :junk-allowed t))
+                               (tail (subseq line (1+ sp2)))
+                               (sp3 (position #\Space tail))
+                               (name (if sp3 (subseq tail 0 sp3) tail)))
+                          (when (and addr (plusp addr) (plusp (length name)))
+                            (setf (gethash name tbl) addr)))
+                   finally (return tbl)))
+           (read-or-nil (path)
+             (handler-case
+                 (with-open-file (s path :direction :input) (parse-stream s))
+               (error () nil))))
+    (or (let ((tbl (read-or-nil "/proc/kallsyms")))
+          (and tbl (plusp (hash-table-count tbl)) tbl))
+        ;; Try /boot/System.map-<release>, the package-installed image map.
+        (let* ((release (string-trim
+                         '(#\Newline #\Space)
+                         (with-output-to-string (out)
+                           (handler-case
+                               (sb-ext:run-program "/usr/bin/uname" '("-r")
+                                                   :output out :wait t)
+                             (error () nil)))))
+               (path (and (plusp (length release))
+                          (concatenate 'string "/boot/System.map-" release))))
+          (and path (read-or-nil path)))
+        (make-hash-table :test 'equal))))
 
 (defun lower-kaddr-call (args)
   "Lower kaddr(\"name\") to the integer address of kernel symbol NAME,
