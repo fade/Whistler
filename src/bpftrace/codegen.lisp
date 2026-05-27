@@ -79,6 +79,12 @@
                  (second (second args)))))
     (or n +bt-str-default-len+)))
 
+(defconstant +bt-func-name-key-len+ 64
+  "Fixed slot width for a `func' or `probe' builtin used as a map
+   key. The biggest kernel function name in /proc/kallsyms tends to
+   sit comfortably under 64 bytes; bpftrace itself uses the same
+   default.")
+
 (defun expr-size (expr)
   "Best-effort byte-size for EXPR when used as a map key. Must match
    what the lowering will store on the stack — a mismatch trips the
@@ -91,6 +97,8 @@
     (:var     8)
     (:bin     8)
     (:comm    16)
+    (:func        +bt-func-name-key-len+)
+    (:probe-name  +bt-func-name-key-len+)
     (:kstack  4)
     (:ustack  4)
     (:call
@@ -146,11 +154,16 @@
      (loop for e in keys
            for size = (cond
                         ((eq (first e) :comm) +bt-comm-len+)
+                        ((or (eq (first e) :func)
+                             (eq (first e) :probe-name))
+                         +bt-func-name-key-len+)
                         ((or (str-call-p e) (kstr-call-p e))
                          (str-key-size e))
                         (t 8))
            for type = (cond
                         ((eq (first e) :comm) u8)
+                        ((or (eq (first e) :func)
+                             (eq (first e) :probe-name)) u8)
                         ((or (str-call-p e) (kstr-call-p e)) u8)
                         (t u64))
            collect (list offset size type e)
@@ -163,6 +176,8 @@
     (:arg     :arg)
     (:retval  :retval)
     (:comm    :comm)
+    (:func        :str)
+    (:probe-name  :str)
     (:kstack  :kstack)
     (:ustack  :ustack)
     (:call    (cond ((or (str-call-p expr) (kstr-call-p expr)) :str)
@@ -999,8 +1014,9 @@
 
 (defun store-key-component (buf offset type expr)
   "Emit the kernel form that fills (buf+offset, size-of-type) with EXPR's
-   value. String-typed slots (comm / str / kstr) fill the buffer via
-   their helper; everything else is a plain typed store."
+   value. String-typed slots (comm / str / kstr / literal from
+   func/probe rewrite) fill the buffer via their helper or via byte
+   stores; everything else is a plain typed store."
   (cond
     ((eq (first expr) :comm)
      `(whistler::get-current-comm (+ ,buf ,offset) ,+bt-comm-len+))
@@ -1013,11 +1029,16 @@
                         (intern "PROBE-READ-KERNEL-STR" :whistler))))
        ;; Zero the slot first so any bytes past the str()'s NUL stay
        ;; defined — the BPF verifier rejects a map_update whose key
-       ;; buffer has uninitialised bytes (probe_read_user_str only
-       ;; writes up to and including the trailing NUL).
+       ;; buffer has uninitialised bytes.
        `(progn
           (whistler::memset ,buf ,offset 0 ,size)
           (,helper (+ ,buf ,offset) ,size ,ptr))))
+    ((eq (first expr) :str)
+     ;; A string-literal key — produced by the func/probe rewrite.
+     ;; The slot is fixed-width +bt-func-name-key-len+; write the
+     ;; bytes plus NUL-pad to the full width.
+     (lower-printf-string-literal buf offset (second expr)
+                                  +bt-func-name-key-len+))
     (t `(whistler::store ,type ,buf ,offset ,(lower-expr expr)))))
 
 (defun with-key (keys body-fn)
@@ -1211,12 +1232,14 @@
 (defun keys-need-ptr-ops-p (keys)
   "T iff the keys form requires the kernel -ptr map ops (whistler's
    struct-key path). Triggered by composite keys or by a single
-   string-typed key (`comm', `str(…)', `kstr(…)') — all of these
-   produce a stack buffer pointer rather than a u64."
+   string-typed key (`comm', `str(…)', `kstr(…)', `func', `probe').
+   All of these produce a stack buffer pointer rather than a u64."
   (or (> (length keys) 1)
       (and (= (length keys) 1)
            (let ((k (first keys)))
              (or (eq (first k) :comm)
+                 (eq (first k) :func)
+                 (eq (first k) :probe-name)
                  (str-call-p k)
                  (kstr-call-p k))))))
 
@@ -1475,13 +1498,11 @@
     (t                                     nil)))
 
 (defun rewrite-self-refs (form probe-string func-string)
-  "Walk FORM (an AST). Inside printf calls, rewrite (:PROBE-NAME) and
-   (:FUNC) to (:str ...) so they flow through the printf string-slot
-   path. Outside printf they stay as the original builtin nodes —
-   using them as a map key, predicate, or arithmetic operand isn't
-   supported yet (only string-typed printf args). lower-expr's existing
-   :probe-name/:func handlers raise BPFTRACE-UNSUPPORTED for those."
-  (labels ((rewrite-printf-arg (arg)
+  "Walk FORM (an AST). Inside printf calls AND inside map keys,
+   rewrite (:PROBE-NAME) and (:FUNC) to (:str ...) so they flow
+   through the string-slot machinery. Outside those two contexts
+   they stay as the original builtin nodes."
+  (labels ((rewrite-leaf (arg)
              (cond
                ((not (consp arg)) arg)
                ((and (eq (first arg) :probe-name) (null (rest arg)))
@@ -1490,21 +1511,25 @@
                 (cond
                   (func-string (list :str func-string))
                   (t (unsupported "`func' is undefined for this probe type"))))
-               ;; Recurse so nested cases (e.g. ksym(reg("ip")) is fine,
-               ;; though there's no nested probe/func use case we know
-               ;; of) still get processed.
-               (t (cons (rewrite-printf-arg (first arg))
-                        (rewrite-printf-arg (rest arg))))))
+               (t (cons (rewrite-leaf (first arg))
+                        (rewrite-leaf (rest arg))))))
            (walk (f)
              (cond
                ((not (consp f)) f)
-               ;; printf(... fmt, args ...) — rewrite each arg only.
+               ;; printf(...) — rewrite within its args list.
                ((and (eq (first f) :call)
                      (let ((n (getf (cdr f) :name)))
                        (and (stringp n) (string= n "printf"))))
-                (let* ((args   (getf (cdr f) :args))
-                       (new    (mapcar #'rewrite-printf-arg args)))
-                  (list :call :name "printf" :args new)))
+                (list :call :name "printf"
+                      :args (mapcar #'rewrite-leaf (getf (cdr f) :args))))
+               ;; @m[key…] — rewrite within its keys list.
+               ((and (eq (first f) :map) (getf (cdr f) :keys))
+                (loop for (k v) on (cdr f) by #'cddr
+                      append (list k (if (eq k :keys)
+                                         (mapcar #'rewrite-leaf v)
+                                         v))
+                        into rest
+                      finally (return (cons :map rest))))
                (t (cons (walk (first f)) (walk (rest f)))))))
     (walk form)))
 
