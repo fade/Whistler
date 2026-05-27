@@ -1127,6 +1127,12 @@
   (argv (* (* sb-alien:char)))
   (envp (* (* sb-alien:char))))
 
+(defun process-environ-sap ()
+  "Return the host process's environ pointer as an alien (* (* char)).
+   Used to pass our LANG/LC_*/PATH on to a child spawned via execve;
+   bpftrace does the same so locale-aware programs behave normally."
+  (sb-alien:extern-alien "environ" (* (* sb-alien:char))))
+
 (sb-alien:define-alien-routine ("_exit" %_exit) sb-alien:void
   (code sb-alien:int))
 
@@ -1194,7 +1200,7 @@
                (%ptrace +ptrace-traceme+ 0 0 0)
                (%raise +sigstop+)
                (let ((argv (build-cstr-array args)))
-                 (%execve path argv (sb-sys:int-sap 0))))
+                 (%execve path argv (process-environ-sap))))
            (error () nil))
          (%_exit 127))
         (t
