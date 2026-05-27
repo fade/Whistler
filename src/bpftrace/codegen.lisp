@@ -248,10 +248,8 @@
                    ((and (consp rhs) (eq (first rhs) :cast))
                     (setf (minfo-value-struct info)
                           (getf (cdr rhs) :type)))
-                   ;; `@m[k] = :str LITERAL' — typically the result of
-                   ;; rewrite-self-refs on a `func' / `probe' RHS.
-                   ;; Size the value to hold the longest literal, plus
-                   ;; one byte for the NUL terminator.
+                   ;; `@m[k] = :str LITERAL' — direct string literal
+                   ;; RHS. Size to hold the literal plus a NUL byte.
                    ((and (consp rhs) (eq (first rhs) :str))
                     (let* ((bytes (sb-ext:string-to-octets
                                    (second rhs) :external-format :utf-8))
@@ -261,6 +259,19 @@
                             (minfo-value-size info)
                             (max (minfo-value-size info) need
                                  +bt-func-name-key-len+))))
+                   ;; `@m[k] = func' / `= probe' — rewrite-self-refs
+                   ;; will turn these into :str at lower time, but
+                   ;; infer-maps runs first and needs to mark the
+                   ;; value slot as a string so the right write path
+                   ;; gets taken.
+                   ((and (consp rhs)
+                         (or (eq (first rhs) :func)
+                             (eq (first rhs) :probe-name)))
+                    (setf (minfo-kind info) :scalar
+                          (minfo-value-string-p info) t
+                          (minfo-value-size info)
+                          (max (minfo-value-size info)
+                               +bt-func-name-key-len+)))
                    ;; `@m[k] = comm' — store the current task's
                    ;; TASK_COMM_LEN-byte name. Same string-slot
                    ;; machinery as the :str case.
