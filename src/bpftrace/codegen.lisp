@@ -1349,52 +1349,88 @@
 
 (defun lower-chained-field (root-ptr-form root-struct-name chain)
   "Walk BTF for each name in CHAIN, summing offsets through embedded
-   structs/unions until a scalar leaf. Emits a single probe_read_kernel
-   from (ROOT-PTR-FORM + total-offset). Walks by raw type-id so
-   anonymous unions inside named fields (e.g. struct in6_addr::in6_u)
-   stay traversable. Pointer-traversal (a mid-chain pointer field
-   you then dot through) is not yet handled."
+   structs/unions until a scalar leaf. Mid-chain pointer fields are
+   handled by emitting a probe_read_kernel of the pointer value
+   into a scratch slot, then continuing the walk from the loaded
+   pointer with offset reset to 0.
+
+   Emits a single combined probe_read_kernel per pointer-free
+   segment of the chain — embedded struct/union hops sum offsets
+   in place, so e.g. \`\$sk.__sk_common.skc_family' is still one
+   read while \`\$cgrp.kn.id' becomes two reads."
   (let* ((vmbtf (whistler:ensure-vmlinux-btf))
          (current-tid (whistler:btf-find-struct vmbtf root-struct-name))
-         (total-offset 0)
+         (cur-ptr root-ptr-form)   ; base pointer for the current segment
+         (segment-offset 0)          ; offset within this segment
+         (deref-bindings nil)        ; list of (sym init) pairs for the wrap
          (final-size nil)
          (final-type nil))
     (unless current-tid
       (unsupported "field walk: struct ~A not in vmlinux BTF" root-struct-name))
-    (dolist (fname chain)
-      (let* ((fields (whistler:btf-struct-fields vmbtf current-tid))
-             (cell   (find fname fields :test #'string= :key #'first)))
-        (unless cell
-          (unsupported "->~A: no such field on current struct" fname))
-        (let ((bpf-type (second cell))
-              (offset   (third cell))
-              (size     (fourth cell))
-              (sub-name (fifth cell))
-              (sub-tid  (sixth cell)))
-          (incf total-offset offset)
-          (cond
-            ;; Embedded struct/union — keep walking by type-id.
-            ((and (null bpf-type) sub-name
-                  (not (string= fname (car (last chain)))))
-             (setf current-tid sub-tid))
-            ;; Scalar leaf.
-            ((and (string= fname (car (last chain)))
-                  (member size '(1 2 4 8)))
-             (setf final-size size)
-             (setf final-type (case size
-                                (1 (intern "U8"  :whistler))
-                                (2 (intern "U16" :whistler))
-                                (4 (intern "U32" :whistler))
-                                (8 (intern "U64" :whistler)))))
-            (t (unsupported
-                "field chain ~{.~A~} — leaf must be a 1/2/4/8 byte scalar"
-                chain))))))
-    (let ((scratch (gensym "F")))
-      `(let ((,scratch (whistler::struct-alloc ,final-size)))
-         (whistler::probe-read-kernel
-          ,scratch ,final-size
-          (whistler::+ ,root-ptr-form ,total-offset))
-         (whistler::load ,final-type ,scratch 0)))))
+    (labels ((leaf? (name) (string= name (car (last chain))))
+             (start-new-segment-by-deref ()
+               "Open a new segment from `*deref-of-current-pointer*':
+                allocate a u64 scratch, probe-read 8 bytes at the
+                current segment's tail offset, replace cur-ptr with
+                a fresh name that names the loaded pointer."
+               (let ((scratch (gensym "DEREF"))
+                     (ptrvar  (gensym "PTR")))
+                 (push (list scratch `(whistler::struct-alloc 8)) deref-bindings)
+                 (push (list ptrvar
+                             `(progn
+                                (whistler::probe-read-kernel
+                                 ,scratch 8 (whistler::+ ,cur-ptr ,segment-offset))
+                                (whistler::load whistler::u64 ,scratch 0)))
+                       deref-bindings)
+                 (setf cur-ptr ptrvar
+                       segment-offset 0))))
+      (dolist (fname chain)
+        (let* ((fields (whistler:btf-struct-fields vmbtf current-tid))
+               (cell   (find fname fields :test #'string= :key #'first)))
+          (unless cell
+            (unsupported "->~A: no such field on current struct" fname))
+          (let ((bpf-type (second cell))
+                (offset   (third cell))
+                (size     (fourth cell))
+                (sub-name (fifth cell))
+                (sub-tid  (sixth cell)))
+            (incf segment-offset offset)
+            (cond
+              ;; Embedded struct/union — keep walking by type-id, no
+              ;; new probe-read needed.
+              ((and (null bpf-type) sub-name (not (leaf? fname)))
+               (setf current-tid sub-tid))
+              ;; Pointer-typed field, not at leaf — dereference and
+              ;; continue from the pointed-to struct.
+              ((and (eql size 8) (stringp sub-name) (string= sub-name "ptr")
+                    (not (leaf? fname)))
+               (let ((target (whistler:btf-ptr-target-type-id vmbtf sub-tid)))
+                 (unless target
+                   (unsupported "->~A: can't follow pointer (no target type)"
+                                fname))
+                 (start-new-segment-by-deref)
+                 (setf current-tid target)))
+              ;; Scalar leaf.
+              ((and (leaf? fname) (member size '(1 2 4 8)))
+               (setf final-size size)
+               (setf final-type (case size
+                                  (1 (intern "U8"  :whistler))
+                                  (2 (intern "U16" :whistler))
+                                  (4 (intern "U32" :whistler))
+                                  (8 (intern "U64" :whistler)))))
+              (t (unsupported
+                  "field chain ~{.~A~} — leaf must be a 1/2/4/8 byte scalar"
+                  chain)))))))
+    ;; Emit the final segment's leaf read.
+    (let* ((scratch (gensym "F"))
+           (read    `(let ((,scratch (whistler::struct-alloc ,final-size)))
+                       (whistler::probe-read-kernel
+                        ,scratch ,final-size
+                        (whistler::+ ,cur-ptr ,segment-offset))
+                       (whistler::load ,final-type ,scratch 0))))
+      (if deref-bindings
+          `(let* ,(reverse deref-bindings) ,read)
+          read))))
 
 (defun lower-struct-pointer-field (struct-name field-name ptr-form)
   "Generate the kernel-side read for STRUCT-NAME pointer pointed to by

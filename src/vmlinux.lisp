@@ -306,6 +306,31 @@
           (when bpf-type
             (values bpf-type nelems size)))))))
 
+(defun btf-ptr-target-type-id (vmbtf type-id)
+  "If TYPE-ID resolves through typedefs to a BTF pointer kind, return
+   the pointed-to type-id (also resolved past typedefs to its
+   underlying struct/union/etc.). Otherwise NIL."
+  (multiple-value-bind (raw-id raw-kind) (btf-member-raw-type-id vmbtf type-id)
+    (declare (ignore raw-id))
+    (when (eql raw-kind +btf-kind-ptr+)
+      (let* ((types (vmlinux-btf-types vmbtf))
+             (loop-id type-id))
+        ;; Walk typedef chain to the actual pointer rec, grab :size.
+        (loop for rec = (aref types loop-id)
+              while rec
+              for kind = (getf rec :kind)
+              do (cond
+                   ((member kind (list +btf-kind-typedef+ +btf-kind-volatile+
+                                       +btf-kind-const+ +btf-kind-restrict+))
+                    (setf loop-id (getf rec :size)))
+                   ((eql kind +btf-kind-ptr+)
+                    (return
+                      (multiple-value-bind (resolved-id _kind)
+                          (btf-member-raw-type-id vmbtf (getf rec :size))
+                        (declare (ignore _kind))
+                        resolved-id)))
+                   (t (return nil))))))))
+
 (defun btf-member-raw-type-id (vmbtf member-type-id)
   "Follow typedef/const/volatile/restrict chain without collapsing to a scalar.
    Returns the underlying type-id (struct, array, int, ptr, etc.)."
