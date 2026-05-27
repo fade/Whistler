@@ -302,7 +302,7 @@
   scalar-var     = <'$'> ident
 
   builtin        = builtin-name !ident-char
-  builtin-name   = 'ppid' / 'pid' / 'tid' / 'uid' / 'gid' / 'nsecs' / 'elapsed' /
+  builtin-name   = 'pcomm' / 'ppid' / 'pid' / 'tid' / 'uid' / 'gid' / 'nsecs' / 'elapsed' /
                    'cpu' / 'comm' / 'probe' / 'func' / 'retval' / 'curtask' /
                    'cgroup' / 'rand' / 'args' / 'kstack' / 'ustack' /
                    'arg0' / 'arg1' / 'arg2' / 'arg3' / 'arg4' /

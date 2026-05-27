@@ -713,6 +713,41 @@
       (let ((key (string-downcase (substitute #\_ #\- (symbol-name sym)))))
         (cdr (assoc key map-alist :test #'string=))))))
 
+(defun find-elapsed-map (gen map-alist)
+  (let ((sym (getf gen :elapsed-map)))
+    (when sym
+      (let ((key (string-downcase (substitute #\_ #\- (symbol-name sym)))))
+        (cdr (assoc key map-alist :test #'string=))))))
+
+(defun populate-elapsed-map (elapsed-info)
+  "Write CLOCK_BOOTTIME nanoseconds into slot 0 of the elapsed array
+   map, matching bpftrace's `elapsed' contract: the kernel side
+   computes `nsecs - <this value>' to get time since script start."
+  (when elapsed-info
+    (let* ((ts-bytes (boot-time-ns-as-le-bytes))
+           (key-bytes (whistler/loader::encode-int-key
+                       0 (whistler/loader::map-info-key-size elapsed-info))))
+      (whistler/loader::map-update elapsed-info key-bytes ts-bytes 0))))
+
+(defun boot-time-ns-as-le-bytes ()
+  "Read CLOCK_BOOTTIME via clock_gettime(2) and encode as a u64
+   little-endian byte vector for the elapsed map slot."
+  (let* ((ns (sb-alien:with-alien ((ts (sb-alien:struct sb-unix::timespec)))
+               (sb-alien:alien-funcall
+                (sb-alien:extern-alien
+                 "clock_gettime"
+                 (function sb-alien:int sb-alien:int
+                           (* (sb-alien:struct sb-unix::timespec))))
+                7  ; CLOCK_BOOTTIME
+                (sb-alien:addr ts))
+               (+ (* 1000000000
+                     (sb-alien:slot ts 'sb-unix::tv-sec))
+                  (sb-alien:slot ts 'sb-unix::tv-nsec))))
+         (bytes (make-array 8 :element-type '(unsigned-byte 8))))
+    (loop for i below 8
+          do (setf (aref bytes i) (ldb (byte 8 (* i 8)) ns)))
+    bytes))
+
 (defun lookup-stack-ips (stacks-info stack-id depth)
   "Look up a stack-trace map entry by stack ID and return a list of
    u64 IPs (truncated at the first 0)."
@@ -1128,6 +1163,9 @@
            (exit-info  (find-exit-map gen map-alist))
            (print-info (find-print-map gen map-alist))
            (stacks-info (find-stacks-map gen map-alist))
+           ;; Populate the elapsed-start map *before* attaching probes
+           ;; so the very first probe firing sees a non-zero baseline.
+           (_elapsed (populate-elapsed-map (find-elapsed-map gen map-alist)))
            (stack-depth (or (getf gen :stack-depth) 32))
            ;; Userspace symboliser for ustack frames. Allocated once
            ;; per session; per-pid /proc/<pid>/maps snapshots happen

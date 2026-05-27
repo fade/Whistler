@@ -539,7 +539,35 @@
     (:cpu    '(whistler::get-smp-processor-id))
     (:cgroup '(whistler::get-current-cgroup-id))
     (:rand   '(whistler::get-prandom-u32))
+    ;; bpftrace `elapsed' = current nsecs - script-start nsecs.
+    ;; The hidden array map is populated by userspace before attach
+    ;; (see runtime.lisp's session bring-up).
+    (:elapsed
+     `(whistler::- (whistler::ktime-get-boot-ns)
+                   (whistler:getmap ,*elapsed-map-name* 0)))
     (t       (unsupported "builtin ~A" kw))))
+
+(defun lower-pcomm-into-record (rec off size)
+  "Emit the kernel-side reads that fill REC[OFF..OFF+SIZE) with the
+   parent task's `comm' (TASK_COMM_LEN bytes). Walks
+   current_task → real_parent (pointer field), then probe-reads the
+   comm[] member directly into the printf record."
+  (let* ((vmbtf (whistler:ensure-vmlinux-btf))
+         (tid (whistler:btf-find-struct vmbtf "task_struct"))
+         (fields (and tid (whistler:btf-struct-fields vmbtf tid)))
+         (rp (find "real_parent" fields :test #'string= :key #'first))
+         (co (find "comm"        fields :test #'string= :key #'first))
+         (rp-off (and rp (third rp)))
+         (co-off (and co (third co)))
+         (parent (gensym "PPARENT")))
+    (unless (and rp-off co-off)
+      (unsupported "pcomm: vmlinux BTF missing task_struct.real_parent/comm"))
+    `(let ((,parent (whistler::struct-alloc 8)))
+       (whistler::probe-read-kernel
+        ,parent 8 (whistler::+ (whistler::get-current-task) ,rp-off))
+       (whistler::probe-read-kernel
+        (+ ,rec ,off) ,size
+        (whistler::+ (whistler::load whistler::u64 ,parent 0) ,co-off)))))
 
 (defun lower-ppid-builtin ()
   "Parent PID — walk `current_task->real_parent->tgid'. real_parent
@@ -692,6 +720,11 @@
   "Hidden BPF_MAP_TYPE_STACK_TRACE map. Each entry is an array of
    u64 instruction pointers — the kernel stack at the moment
    `kstack' fired. Looked up by stack-id (u32) at print time.")
+
+(defparameter *elapsed-map-name* (intern "--BT-ELAPSED--" :whistler)
+  "Hidden 1-entry array map holding CLOCK_BOOTTIME nanoseconds at
+   script-start. Populated by the userspace runtime BEFORE any probe
+   attaches; `elapsed' lowers to `(- nsecs (getmap … 0))'.")
 
 (defconstant +bt-stack-depth+ 32
   "Frames captured per kstack entry. Value-size = 8 * depth = 256.")
@@ -1006,6 +1039,10 @@
   (cond
     ((eq (first expr) :comm)
      (cons :string +bt-comm-len+))
+    ;; pcomm — parent task's TASK_COMM_LEN-byte comm. Same slot width
+    ;; as comm; the kernel side walks real_parent before copying.
+    ((eq (first expr) :pcomm)
+     (cons :string +bt-comm-len+))
     ;; A `\$v' whose latest assignment came from ntop(…) — the var
     ;; holds a pointer to its per-probe 17-byte slot.
     ((and (eq (first expr) :var)
@@ -1167,6 +1204,8 @@
        (cond
          ((eq (first arg) :comm)
           `(whistler::get-current-comm (+ ,rec ,off) ,size))
+         ((eq (first arg) :pcomm)
+          (lower-pcomm-into-record rec off size))
          ((str-call-p arg)
           (let* ((args (getf (cdr arg) :args))
                  (ptr  (lower-expr (first args)))
@@ -2264,6 +2303,18 @@
 
 ;;; ========== Public entry ==========
 
+(defun script-uses-elapsed-p (script)
+  "T iff the script references the `elapsed' builtin anywhere — gates
+   creation of the hidden script-start nsecs map."
+  (labels ((walk (form)
+             (cond
+               ((not (consp form)) nil)
+               ((and (eq (first form) :builtin) (eq (second form) :elapsed))
+                t)
+               (t (some #'walk form)))))
+    (some (lambda (probe) (walk (getf (cdr probe) :body)))
+          (script-probes script))))
+
 (defun script-uses-exit-p (script)
   "Walk SCRIPT and return T if any call to `exit()` appears anywhere
    in any probe body. Used to decide whether to inject the hidden
@@ -2330,6 +2381,7 @@
          (uses-exit (script-uses-exit-p script))
          (uses-printf (script-uses-printf-p script))
          (uses-kstack (script-uses-kstack-p script))
+         (uses-elapsed (script-uses-elapsed-p script))
          (exit-map-form
            (when uses-exit
              `(whistler:defmap ,*exit-map-name*
@@ -2345,6 +2397,10 @@
                 :key-size 4
                 :value-size ,(* 8 +bt-stack-depth+)
                 :max-entries 4096)))
+         (elapsed-map-form
+           (when uses-elapsed
+             `(whistler:defmap ,*elapsed-map-name*
+                :type :array :key-size 4 :value-size 8 :max-entries 1)))
          (probes    nil)
          (user      nil)
          (tp-preamble (gen-deftracepoint-preamble script)))
@@ -2356,12 +2412,14 @@
     (list :maps (append (when exit-map-form    (list exit-map-form))
                         (when print-map-form   (list print-map-form))
                         (when stacks-map-form  (list stacks-map-form))
+                        (when elapsed-map-form (list elapsed-map-form))
                         maps)
           :progs (append tp-preamble probes)
           :user-probes user
           :exit-map (when uses-exit *exit-map-name*)
           :print-map (when uses-printf *print-map-name*)
           :stacks-map (when uses-kstack *stacks-map-name*)
+          :elapsed-map (when uses-elapsed *elapsed-map-name*)
           :stack-depth +bt-stack-depth+
           :printf-table (reverse *printf-table*)
           :time-format-table (reverse *time-format-table*)

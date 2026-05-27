@@ -508,6 +508,7 @@
       ((string= name "retval")  '(:retval))
       ((string= name "args")    '(:args))
       ((string= name "comm")    '(:comm))
+      ((string= name "pcomm")   '(:pcomm))
       ((string= name "probe")   '(:probe-name))
       ((string= name "func")    '(:func))
       ((string= name "curtask") '(:curtask))
