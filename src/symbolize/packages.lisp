@@ -25,6 +25,8 @@
    #:sym-name
    #:sym-offset
    #:sym-file
+   #:sym-source-file
+   #:sym-source-line
    ;; Mapping struct (exposed for debugging / introspection)
    #:mapping
    #:mapping-start

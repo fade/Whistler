@@ -23,10 +23,12 @@
 (in-package #:whistler/symbolize)
 
 (defstruct sym
-  addr           ; original input IP (always set)
-  name           ; symbol name string  or NIL when unresolved
-  offset         ; bytes past the start of the symbol; 0 when unresolved
-  file)          ; "/usr/lib64/libc.so.6"  or NIL
+  addr             ; original input IP (always set)
+  name             ; symbol name string  or NIL when unresolved
+  offset           ; bytes past the start of the symbol; 0 when unresolved
+  file             ; "/usr/lib64/libc.so.6"  or NIL
+  source-file      ; source path from DWARF .debug_line, or NIL
+  source-line)     ; source line number from DWARF, or NIL
 
 (defun symbolize (symb pid ip)
   "Resolve IP (a u64 virtual address in process PID) to a SYM struct.
@@ -62,11 +64,18 @@
                                     (- 0 (mapping-offset m)))
                                  ip))
                       (entry (elf-find-symbol elf vaddr)))
-                 (cond
-                   (entry
-                    (make-sym :addr ip
-                              :name (aref entry 2)
-                              :offset (- vaddr (aref entry 0))
-                              :file (mapping-path m)))
-                   (t
-                    (make-sym :addr ip :file (mapping-path m))))))))))))))
+                 (multiple-value-bind (sfile sline)
+                     (let ((li (elf-info-line-info elf)))
+                       (if li (dwarf-line-find li vaddr) (values nil nil)))
+                   (cond
+                     (entry
+                      (make-sym :addr ip
+                                :name (aref entry 2)
+                                :offset (- vaddr (aref entry 0))
+                                :file (mapping-path m)
+                                :source-file sfile
+                                :source-line sline))
+                     (t
+                      (make-sym :addr ip :file (mapping-path m)
+                                :source-file sfile
+                                :source-line sline))))))))))))))

@@ -78,3 +78,32 @@
           (is (search "libc.so" (whistler/symbolize:sym-file sym))
               "file is libc"))))
     (whistler/symbolize:close-symbolizer symb)))
+
+;;; ========== DWARF .debug_line ==========
+
+(test dwarf-line-info-loaded-from-libc
+  "When glibc-debuginfo is installed, libc's ELF-INFO carries a
+   DWARF-LINE-INFO with thousands of rows resolvable to malloc.c."
+  (let ((elf (whistler/symbolize::parse-elf "/usr/lib64/libc.so.6")))
+    (let ((li (whistler/symbolize::elf-info-line-info elf)))
+      (cond
+        ((null li)
+         ;; No glibc debuginfo on this host; nothing to assert.
+         (pass))
+        (t
+         (is (plusp (length (whistler/symbolize::dwarf-line-info-vaddrs li)))
+             "line table has rows")
+         (is (plusp (length (whistler/symbolize::dwarf-line-info-files li)))
+             "file table is populated")
+         ;; Look up the address of a known function and check the
+         ;; resolved path mentions malloc.c.
+         (let* ((syms (whistler/symbolize::elf-info-symbols elf))
+                (malloc (find "__GI___libc_malloc" syms :test #'string=
+                              :key (lambda (e) (aref e 2)))))
+           (when malloc
+             (multiple-value-bind (file line)
+                 (whistler/symbolize::dwarf-line-find li (aref malloc 0))
+               (is (and file (search "malloc.c" file))
+                   "malloc's IP resolves to malloc.c")
+               (is (and line (plusp line))
+                   "line number is positive")))))))))

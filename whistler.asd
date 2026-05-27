@@ -65,6 +65,7 @@
   :components ((:file "packages")
                (:file "maps")
                (:file "elf")
+               (:file "dwarf")
                (:file "cache")
                (:file "symbolize")))
 

@@ -528,25 +528,27 @@
 
 (defun format-user-frame (ip pid symbolizer)
   "Symbolise a userspace IP against the given PID's maps. Falls back
-   to bare hex if SYMBOLIZER is NIL, PID is NIL, or the lookup fails."
+   to bare hex if SYMBOLIZER is NIL, PID is NIL, or the lookup fails.
+   When DWARF .debug_line is available, appends `file:line' after the
+   library tag."
   (cond
     ((or (null symbolizer) (null pid) (zerop pid))
      (format nil "0x~16,'0X" ip))
     (t
      (let* ((s (whistler/symbolize:symbolize symbolizer pid ip))
-            (name (whistler/symbolize:sym-name s)))
+            (name (whistler/symbolize:sym-name s))
+            (file (whistler/symbolize:sym-file s))
+            (lib  (and file (file-namestring file)))
+            (src  (whistler/symbolize:sym-source-file s))
+            (line (whistler/symbolize:sym-source-line s))
+            (src-tag (and src line
+                          (format nil " ~A:~D" (file-namestring src) line))))
        (cond
          (name
-          (let ((file (whistler/symbolize:sym-file s)))
-            (format nil "~A+0x~X~@[ [~A]~]"
-                    name
-                    (whistler/symbolize:sym-offset s)
-                    (and file (file-namestring file)))))
+          (format nil "~A+0x~X~@[ [~A]~]~@[~A~]"
+                  name (whistler/symbolize:sym-offset s) lib src-tag))
          (t
-          (format nil "0x~16,'0X~@[ [~A]~]"
-                  ip
-                  (let ((f (whistler/symbolize:sym-file s)))
-                    (and f (file-namestring f))))))))))
+          (format nil "0x~16,'0X~@[ [~A]~]~@[~A~]" ip lib src-tag)))))))
 
 (defun format-stack (stack-id stacks-info depth &key user-p pid symbolizer)
   "Render a kstack/ustack key as bpftrace's indented multi-line stack.

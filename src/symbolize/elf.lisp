@@ -84,7 +84,8 @@
 (defstruct elf-info
   path            ; "/usr/lib64/libc.so.6"
   pie-p           ; T if e_type is ET_DYN (loaded at a relocatable base)
-  symbols)        ; sorted vector of #(VADDR SIZE NAME) entries
+  symbols         ; sorted vector of #(VADDR SIZE NAME) entries
+  line-info)      ; DWARF-LINE-INFO from a .debug_line, or NIL
 
 ;;; ========== Parsing ==========
 
@@ -224,6 +225,37 @@
   (let ((info (parse-elf path)))
     (and info (elf-info-symbols info))))
 
+(defun section-with-name (buf secs shstrtab name)
+  "Return the SECTION whose name equals NAME, or NIL."
+  (loop for sec across secs
+        when (string= (section-name buf shstrtab sec) name)
+          return sec))
+
+(defun section-bytes (buf sec)
+  "Return a fresh byte vector containing SEC's payload, or NIL when
+   SEC is NIL / empty."
+  (when (and sec (plusp (section-size sec)))
+    (let* ((off (section-offset sec))
+           (sz  (section-size sec))
+           (out (make-array sz :element-type '(unsigned-byte 8))))
+      (replace out buf :start2 off :end2 (+ off sz))
+      out)))
+
+(defun line-info-from-buf (buf secs shstrtab)
+  "Extract a DWARF-LINE-INFO from BUF, or NIL if .debug_line is absent."
+  (let ((line-sec (section-with-name buf secs shstrtab ".debug_line")))
+    (when line-sec
+      (let ((line-bytes     (section-bytes buf line-sec))
+            (line-str-bytes (section-bytes
+                             buf
+                             (section-with-name buf secs shstrtab ".debug_line_str")))
+            (debug-str-bytes (section-bytes
+                              buf
+                              (section-with-name buf secs shstrtab ".debug_str"))))
+        (handler-case
+            (parse-debug-line line-bytes line-str-bytes debug-str-bytes)
+          (error () nil))))))
+
 (defun merge-symbols (a b)
   "Merge two sorted symbol vectors into one. Duplicates (same VADDR)
    prefer A. Both inputs may be empty."
@@ -240,9 +272,13 @@
 
 (defun parse-elf (path)
   "Read PATH, parse ELF header + section headers, extract function
-   symbols. Tries `.symtab' first (full table, only present in
-   unstripped binaries) then `.dynsym' (exports), then falls back to
-   the separate debug file via build-id or .gnu_debuglink.
+   symbols and any available DWARF line information. Tries
+   `.symtab' first (full, only in unstripped binaries) then
+   `.dynsym' (exports), then falls back to the separate debug file
+   via build-id or .gnu_debuglink.
+
+   `.debug_line' is also pulled from the binary itself when present,
+   otherwise from the debug file.
 
    Returns an ELF-INFO, or NIL if the file isn't a readable ELF64
    we understand."
@@ -258,22 +294,40 @@
                    (str-sec (and sym-sec (aref secs (section-link sym-sec))))
                    (own-syms (and sym-sec
                                   (parse-symbol-table buf sym-sec str-sec)))
-                   ;; If there's no .symtab in this file, try fetching one
-                   ;; from a separate debug file. Merge with whatever we
-                   ;; got from .dynsym (which has exports only).
-                   (debug-syms
-                     (unless symtab-sec
+                   (own-line (line-info-from-buf buf secs shstrtab))
+                   ;; If there's no .symtab in this file, or no
+                   ;; .debug_line, try the separate debug file.
+                   (need-debug-p (or (null symtab-sec) (null own-line)))
+                   (dbg-extras
+                     (when need-debug-p
                        (let* ((build-id (read-build-id buf secs shstrtab))
                               (link     (read-debuglink buf secs shstrtab))
                               (dbg-path (find-debug-file path build-id link)))
-                         (when dbg-path
-                           (parse-elf-symbols-from dbg-path)))))
+                         (when dbg-path (read-debug-extras dbg-path)))))
+                   (debug-syms (and dbg-extras (car dbg-extras)))
+                   (debug-line (and dbg-extras (cdr dbg-extras)))
                    (syms (if debug-syms
                              (merge-symbols (or own-syms #()) debug-syms)
                              (or own-syms #()))))
               (make-elf-info :path path
                              :pie-p (= e-type +et-dyn+)
-                             :symbols syms))))))))
+                             :symbols syms
+                             :line-info (or own-line debug-line)))))))))
+
+(defun read-debug-extras (path)
+  "Read PATH (a separate debug file) and return (SYMBOLS . LINE-INFO).
+   Either component may be NIL."
+  (let ((buf (read-file-bytes path)))
+    (when (and buf (valid-elf64-p buf))
+      (multiple-value-bind (secs shstrtab) (read-section-headers buf)
+        (let* ((sym-sec
+                 (loop for sec across secs
+                       when (= (section-type sec) +sht-symtab+) return sec
+                       when (= (section-type sec) +sht-dynsym+) return sec))
+               (str-sec (and sym-sec (aref secs (section-link sym-sec))))
+               (syms (and sym-sec (parse-symbol-table buf sym-sec str-sec)))
+               (line (line-info-from-buf buf secs shstrtab)))
+          (cons syms line))))))
 
 (defun elf-find-symbol (elf-info vaddr)
   "Binary search ELF-INFO's symbol vector for the entry whose
