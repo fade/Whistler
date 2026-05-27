@@ -352,7 +352,7 @@
                 "BEGIN { $i = 0; while ($i < 3) { $i += 1; } }")))
          (body (getf (cdr (second ast)) :body))
          (loop-stmt (find :while body :key #'first)))
-    (is loop-stmt)
+    (is (not (null loop-stmt)))
     (is (eq :while (first loop-stmt)))))
 
 (test codegen-while-loop
