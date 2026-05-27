@@ -4,6 +4,12 @@
 ;;;
 ;;; SPDX-License-Identifier: MIT
 
+;; whistler.lisp's `-c CMD' flow forks + ptrace via sb-posix:waitpid /
+;; sb-posix:kill. sb-posix is a contrib that has to be required
+;; explicitly.
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (require :sb-posix))
+
 (defpackage #:whistler/bpf
   (:use #:cl)
   (:export

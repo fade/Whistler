@@ -1023,6 +1023,11 @@
          ;; bpftrace doesn't either; if the user wants only the child's
          ;; pid they pass both -c and -p.
          (child-process (when cmd-arg (spawn-traced-process cmd-arg)))
+         ;; bpftrace's PidFilterPass only injects the predicate when
+         ;; -p is set (it consults bpftrace_.pid() which is nullopt
+         ;; for -c). For -c the trace is intentionally system-wide
+         ;; during the child's lifetime, because the child often
+         ;; spawns subprocesses with different pids.
          (filter-var  (find-symbol "*PID-FILTER*"    '#:whistler/bpftrace))
          (child-var   (find-symbol "*CHILD-PROCESS*" '#:whistler/bpftrace))
          (hook-var    (find-symbol "*POST-ATTACH-HOOK*" '#:whistler/bpftrace))
@@ -1047,14 +1052,20 @@
            (format t "~S~%" (getf gen :user-probes))))
         (t
          (when child-process
-           (format t ";; -c spawned pid ~D — tracing until it exits.~%"
-                   (sb-ext:process-pid child-process))
+           (format t ";; -c spawned pid ~D (ptrace-stopped) — tracing until it exits.~%"
+                   (traced-child-pid child-process))
            (force-output))
          (unwind-protect
               (funcall (find-symbol "RUN" '#:whistler/bpftrace) source)
-           (when (and child-process (sb-ext:process-alive-p child-process))
-             (handler-case (sb-ext:process-kill child-process 15) (error () nil))
-             (handler-case (sb-ext:process-wait child-process) (error () nil)))))))))
+           (when child-process
+             ;; If still alive, send SIGTERM and reap; otherwise just
+             ;; reap any zombie.
+             (handler-case
+                 (sb-posix:kill (traced-child-pid child-process) 15)
+               (error () nil))
+             (handler-case
+                 (sb-posix:waitpid (traced-child-pid child-process) 0)
+               (error () nil)))))))))
 
 (defun read-bpftrace-source (args e-pos p-pos c-pos)
   "Resolve the script source: -e takes precedence; otherwise the first
@@ -1083,30 +1094,92 @@
                   (n   (read-sequence buf s)))
              (subseq buf 0 n))))))))
 
-(defun spawn-traced-process (cmd)
-  "Spawn CMD via /bin/sh -c, but make the child block until the
-   parent has attached its probes. We launch
-     sh -c 'read _; exec sh -c CMD'
-   so the inner sh blocks on `read' from its stdin until we write a
-   newline (after attach). bpftrace uses PTRACE_TRACEME + SIGSTOP for
-   the same effect; pipe-block is the no-ptrace shortcut and is
-   sufficient because we only need to defer the first exec, not single-
-   step the child."
-  (sb-ext:run-program
-   "/bin/sh"
-   (list "-c"
-         (format nil "read _; exec /bin/sh -c ~S" cmd))
-   :wait nil
-   :input :stream
-   :output t :error t))
+;;; ========== ptrace-stopped child spawn (matches bpftrace -c) ==========
+;;;
+;;; bpftrace's `-c CMD' uses PTRACE_TRACEME from the child so the
+;;; kernel stops the child at the exec entry. The parent attaches its
+;;; probes, then PTRACE_DETACH lets the child run. This is critical
+;;; for short-lived commands: every syscall the child makes happens
+;;; AFTER probes are live.
+;;;
+;;; SBCL doesn't expose a pre-exec hook, so we do the dance ourselves
+;;; via sb-posix:fork + sb-alien for ptrace / raise / execve.
 
-(defun release-traced-process (process)
-  "Unblock the child spawned by spawn-traced-process: write a newline
-   to its stdin to satisfy the leading `read', then close so the
-   inner exec runs."
-  (let ((in (sb-ext:process-input process)))
-    (when in
-      (write-line "" in)
-      (force-output in)
-      (close in))))
+(defconstant +ptrace-traceme+   0)
+(defconstant +ptrace-detach+    17)
+(defconstant +sigstop+          19)
+(defconstant +sigcont+          18)
+
+(sb-alien:define-alien-routine ("ptrace" %ptrace) sb-alien:long
+  (request sb-alien:int)
+  (pid     sb-alien:int)
+  (addr    sb-alien:unsigned-long)
+  (data    sb-alien:unsigned-long))
+
+(sb-alien:define-alien-routine ("raise" %raise) sb-alien:int
+  (sig sb-alien:int))
+
+(sb-alien:define-alien-routine ("execve" %execve) sb-alien:int
+  (path sb-alien:c-string)
+  (argv (* (* sb-alien:char)))
+  (envp (* (* sb-alien:char))))
+
+(sb-alien:define-alien-routine ("_exit" %_exit) sb-alien:void
+  (code sb-alien:int))
+
+(cl:defstruct traced-child
+  "Bookkeeping for a ptrace-stopped child: its pid plus a thunk that
+   resumes it via PTRACE_DETACH."
+  pid release)
+
+(defun build-cstr-array (strings)
+  "Allocate an alien array of NUL-terminated char* pointers, ending in
+   NULL. Returns the alien pointer; caller owns it (we hand off to
+   exec, so SBCL doesn't need to free it)."
+  (let* ((n (length strings))
+         (arr (sb-alien:make-alien (* sb-alien:char) (1+ n))))
+    (loop for i from 0
+          for s in strings do
+      (setf (sb-alien:deref arr i)
+            (sb-alien:make-alien-string s)))
+    (setf (sb-alien:deref arr n) (sb-sys:int-sap 0))
+    arr))
+
+(defun spawn-traced-process (cmd)
+  "Fork CMD via /bin/sh -c with PTRACE_TRACEME — child stops at exec
+   entry, parent then has a clear window to attach probes. Returns a
+   TRACED-CHILD whose RELEASE thunk PTRACE_DETACHes (and SIGCONTs)
+   the child."
+  (let ((pid (sb-posix:fork)))
+    (cond
+      ((zerop pid)
+       ;; --- Child side ---
+       (handler-case
+           (progn
+             (%ptrace +ptrace-traceme+ 0 0 0)
+             (%raise +sigstop+)
+             ;; SIGSTOP put us to sleep; the parent's PTRACE_DETACH
+             ;; resumes us here. Now exec the user command.
+             (let ((argv (build-cstr-array (list "sh" "-c" cmd))))
+               (%execve "/bin/sh" argv (sb-sys:int-sap 0))))
+         (error () nil))
+       ;; If execve returned, something went wrong.
+       (%_exit 127))
+      (t
+       ;; --- Parent side ---
+       ;; Wait for the child's SIGSTOP so we know it's stopped at
+       ;; exec entry before we attach probes.
+       (multiple-value-bind (waited status) (sb-posix:waitpid pid 0)
+         (declare (ignore waited status)))
+       (make-traced-child
+        :pid pid
+        :release (lambda ()
+                   (handler-case
+                       (%ptrace +ptrace-detach+ pid 0 0)
+                     (error () nil))))))))
+
+(defun release-traced-process (child)
+  "Resume the ptrace-stopped child after probes are attached."
+  (when (traced-child-p child)
+    (funcall (traced-child-release child))))
 

@@ -661,10 +661,24 @@
 (defvar *bpftrace-running* nil)
 
 (defvar *child-process* nil
-  "When non-NIL, the sb-ext:process spawned via `-c CMD'. The main
-   poll loop exits as soon as this child exits — matching bpftrace's
-   behaviour where the spawned command's lifetime defines the trace
-   window.")
+  "When non-NIL, an opaque handle for a -c CMD child. The runtime
+   only checks it via child-exited-p so the type can evolve. The
+   CLI binds it to a whistler::traced-child struct with a pid slot.")
+
+(defun child-exited-p (child)
+  "Non-NIL when CHILD has exited. CHILD is the opaque handle the CLI
+   bound — uses waitpid(WNOHANG=1) to peek without blocking. The pid
+   accessor lives in the whistler package; we look it up at the
+   symbol level to avoid pulling whistler into the runtime's
+   :depends-on."
+  (let* ((accessor (find-symbol "TRACED-CHILD-PID" '#:whistler))
+         (pid (when accessor (funcall accessor child))))
+    (when pid
+      (multiple-value-bind (waited status)
+          (handler-case (sb-posix:waitpid pid 1)
+            (error () (values 0 0)))
+        (declare (ignore status))
+        (plusp waited)))))
 
 (defvar *post-attach-hook* nil
   "Optional thunk called once, immediately after all probes attach
@@ -1109,8 +1123,7 @@
                        (loop while (and *bpftrace-running*
                                         (not (exit-flag-set-p exit-info))
                                         (not (and *child-process*
-                                                  (not (sb-ext:process-alive-p
-                                                        *child-process*)))))
+                                                  (child-exited-p *child-process*))))
                              do (if ring-consumer
                                     (whistler/loader::ring-poll
                                      ring-consumer :timeout-ms 100)
