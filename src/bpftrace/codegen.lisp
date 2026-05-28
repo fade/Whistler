@@ -1454,9 +1454,11 @@
      (let ((src (lower-expr arg))
            (i   (gensym "I")))
        `(whistler::dotimes (,i ,+bt-ntop-slot-size+)
+          ;; load/store take immediate offsets; runtime index goes
+          ;; into the base pointer.
           (whistler::store
-           whistler::u8 ,rec (+ ,off ,i)
-           (whistler::load whistler::u8 ,src ,i)))))
+           whistler::u8 (+ ,rec ,off ,i) 0
+           (whistler::load whistler::u8 (+ ,src ,i) 0)))))
     ((and (consp ty) (eq (car ty) :string))
      (let ((size (cdr ty)))
        (cond
@@ -1485,8 +1487,8 @@
           (let ((src (lower-expr arg))
                 (i   (gensym "I")))
             `(whistler::dotimes (,i ,size)
-               (whistler::store whistler::u8 ,rec (+ ,off ,i)
-                                (whistler::load whistler::u8 ,src ,i)))))
+               (whistler::store whistler::u8 (+ ,rec ,off ,i) 0
+                                (whistler::load whistler::u8 (+ ,src ,i) 0)))))
          ;; A field-chain whose leaf is a char[] / u8[] array — emit
          ;; one probe_read_kernel of SIZE bytes from the chain's
          ;; computed pointer.
@@ -2051,8 +2053,8 @@
                   (,p (whistler::map-lookup-ptr ,mname ,kform))
                 (whistler::dotimes (,i ,vsize)
                   (whistler::store
-                   whistler::u8 ,slot-sym ,i
-                   (whistler::load whistler::u8 ,p ,i)))
+                   whistler::u8 (+ ,slot-sym ,i) 0
+                   (whistler::load whistler::u8 (+ ,p ,i) 0)))
                 0)))
       (if ptr-p
           (with-key keys #'copy-body)
@@ -2077,8 +2079,8 @@
                   (,p (whistler::map-lookup-ptr ,mname ,kform))
                 (whistler::dotimes (,i ,+bt-ntop-slot-size+)
                   (whistler::store
-                   whistler::u8 ,slot-sym ,i
-                   (whistler::load whistler::u8 ,p ,i)))
+                   whistler::u8 (+ ,slot-sym ,i) 0
+                   (whistler::load whistler::u8 (+ ,p ,i) 0)))
                 0)))
       (if ptr-p
           (with-key keys #'copy-body)
