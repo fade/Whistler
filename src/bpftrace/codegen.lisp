@@ -2097,10 +2097,11 @@
 
 (defun lower-ntop-assign (slot-sym ntop-args)
   "Lower `$v = ntop(EXPR)' or `$v = ntop(FAMILY, EXPR)' into stores
-   on SLOT-SYM's pre-allocated 17-byte buffer: family at byte 0,
-   address bytes at 1..(N). v4 (1 arg, or AF_INET) → 4-byte u32
-   store. v6 (AF_INET6 family) → probe_read_kernel of 16 bytes from
-   the pointer arg."
+   on SLOT-SYM's pre-allocated 17-byte buffer. Layout: bytes 0..15
+   are the address (v4 left-aligned in the low 4 bytes; v6 fills
+   the whole 16), byte 16 is the AF_* family. Putting the address
+   at offset 0 keeps u32 / u64 stores naturally aligned, which the
+   BPF verifier requires."
   (let* ((family-literal
            (and (cdr ntop-args)
                 (let ((fa (first ntop-args)))
@@ -2109,37 +2110,30 @@
                     (:constant (resolve-constant (second fa)))))))
          (addr-expr
            (if (cdr ntop-args) (second ntop-args) (first ntop-args)))
-         ;; If no explicit family but the addr-expr is a chain ending
-         ;; in a 16-byte array (u8[16]), bpftrace's convention is v6
-         ;; — match that behavior.
          (chain-info (and (null family-literal)
                           (multiple-value-list (analyze-chain addr-expr))))
          (chain-kind (third chain-info))
          (chain-size (second chain-info))
          (chain-ptr  (first chain-info)))
     (cond
-      ;; Two-arg ntop(AF_INET6, ptr) — IPv6, explicit.
       ((eql family-literal 10)
        `(progn
-          (whistler::store whistler::u8 ,slot-sym 0 10)
           (whistler::probe-read-kernel
-           (whistler::+ ,slot-sym 1) 16 ,(lower-chain-as-ptr addr-expr))))
-      ;; One-arg ntop(CHAIN.u8[16]) — IPv6, inferred from leaf shape.
+           ,slot-sym 16 ,(lower-chain-as-ptr addr-expr))
+          (whistler::store whistler::u8 ,slot-sym 16 10)))
       ((and (eq chain-kind :array) (eql chain-size 16))
        `(progn
-          (whistler::store whistler::u8 ,slot-sym 0 10)
-          (whistler::probe-read-kernel
-           (whistler::+ ,slot-sym 1) 16 ,chain-ptr)))
-      ;; One-arg ntop(u32) or two-arg ntop(AF_INET, u32) — IPv4.
+          (whistler::probe-read-kernel ,slot-sym 16 ,chain-ptr)
+          (whistler::store whistler::u8 ,slot-sym 16 10)))
       ((or (null family-literal) (eql family-literal 2))
        `(progn
-          (whistler::store whistler::u8 ,slot-sym 0 2)
-          (whistler::store whistler::u32 ,slot-sym 1
+          (whistler::store whistler::u32 ,slot-sym 0
                            ,(lower-expr addr-expr))
-          ;; Zero the trailing 12 bytes so userspace dispatch on the
-          ;; family byte alone is safe even without re-clearing.
-          ,@(loop for off from 5 below +bt-ntop-slot-size+
-                  collect `(whistler::store whistler::u8 ,slot-sym ,off 0))))
+          ;; Zero the unused middle bytes (4..15) so the v6 decoder
+          ;; would see a clean buffer if it ever read this slot.
+          ,@(loop for off from 4 below 16
+                  collect `(whistler::store whistler::u8 ,slot-sym ,off 0))
+          (whistler::store whistler::u8 ,slot-sym 16 2)))
       (t
        (unsupported "ntop() with non-literal family — only AF_INET/AF_INET6")))))
 

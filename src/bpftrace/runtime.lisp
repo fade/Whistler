@@ -1043,21 +1043,22 @@
                                          (incf off 8)
                                          (resolve-cgroup-path cgid)))
                                       ((eq ty :ipv-any)
-                                       ;; 1 family byte + 16 bytes addr.
-                                       ;; Family AF_INET (2) → v4 of bytes
-                                       ;; 1..4; AF_INET6 (10) → v6 of
-                                       ;; bytes 1..16; anything else → 0.0.0.0.
-                                       (let ((family (sb-sys:sap-ref-8 sap off)))
+                                       ;; Layout: 16 bytes address + 1 byte family.
+                                       ;; v4 (family=2) uses the first 4 address
+                                       ;; bytes; v6 (family=10) uses all 16. The
+                                       ;; family byte is at the END so the kernel
+                                       ;; can do aligned u32/u64 stores at offset 0.
+                                       (let ((family (sb-sys:sap-ref-8 sap (+ off 16))))
                                          (prog1
                                              (cond
                                                ((= family 2)
                                                 (format nil "~D.~D.~D.~D"
+                                                        (sb-sys:sap-ref-8 sap off)
                                                         (sb-sys:sap-ref-8 sap (+ off 1))
                                                         (sb-sys:sap-ref-8 sap (+ off 2))
-                                                        (sb-sys:sap-ref-8 sap (+ off 3))
-                                                        (sb-sys:sap-ref-8 sap (+ off 4))))
+                                                        (sb-sys:sap-ref-8 sap (+ off 3))))
                                                ((= family 10)
-                                                (format-ipv6 sap (+ off 1)))
+                                                (format-ipv6 sap off))
                                                (t "0.0.0.0"))
                                            (incf off 17))))
                                       ((and (consp ty) (eq (car ty) :string))
