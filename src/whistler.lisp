@@ -653,7 +653,9 @@
       ;; Lower + optimize per backend variant. Programs are small enough that
       ;; trying a few complete backend shapes is cheaper than overfitting one
       ;; allocator heuristic path. Reject candidates whose IR has undefined
-      ;; vregs — these would produce BPF verifier 'Rn !read_ok' errors.
+      ;; vregs or dangling branch/PHI labels — these are optimizer-bug signals
+      ;; (the former produces 'Rn !read_ok' verifier errors, the latter NPEs
+      ;; the emitter's jump-fixup pass).
       (let ((best-cu nil))
         (dolist (candidate (backend-candidates))
           (let ((ir (whistler/ir:lower-program section license map-structs expanded
@@ -667,6 +669,12 @@
                            :auto-reserve-helper-setup (getf candidate :auto-reserve-helper-setup))))
                   (when (or (null best-cu) (better-cu-p cu best-cu))
                     (setf best-cu cu)))))))
+        (unless best-cu
+          (error "compile-program: every backend candidate produced malformed IR for ~A. ~
+                  This is an optimizer bug — most likely a CFG transform that left dangling ~
+                  branch targets or undefined vregs. Run with ir-well-formed-p instrumentation ~
+                  to localise the offending pass."
+                 section))
         best-cu))))
 
 (defun reset-compilation-state ()

@@ -2136,49 +2136,6 @@
                (setf (ir-insn-args insn) kept))))))))
   prog)
 
-(defun fix-dangling-branches (prog)
-  "Defence-in-depth: rewrite branches whose target label has been
-   removed into a :ret (:imm 0), and drop PHI operands that
-   reference a missing label. The target is unreachable by
-   construction (otherwise the predecessor would still exist), so
-   returning 0 is semantically equivalent.
-
-   With simplify-cfg's sub-pass C now performing one merge per sweep
-   and rewriting label references in surviving blocks, this pass
-   should rarely fire on first-party code. Kept as a safety net so a
-   future optimizer change can't crash the emitter."
-  (let ((labels (make-hash-table)))
-    (dolist (b (ir-program-blocks prog))
-      (setf (gethash (basic-block-label b) labels) t))
-    (dolist (b (ir-program-blocks prog))
-      (let* ((insns (basic-block-insns b))
-             (term  (car (last insns))))
-        (when (and term (member (ir-insn-op term) '(:br :br-cond)))
-          (let ((has-dangling nil))
-            (dolist (arg (ir-insn-args term))
-              (when (and (consp arg) (eq (first arg) :label)
-                         (not (gethash (second arg) labels)))
-                (setf has-dangling t)))
-            (when has-dangling
-              (setf (ir-insn-op term) :ret)
-              (setf (ir-insn-args term) (list '(:imm 0))))))
-        (dolist (insn insns)
-          (when (eq (ir-insn-op insn) :phi)
-            (let ((kept (remove-if-not
-                          (lambda (arg)
-                            (and (consp arg) (integerp (first arg))
-                                 (consp (second arg))
-                                 (eq (first (second arg)) :label)
-                                 (gethash (second (second arg)) labels)))
-                          (ir-insn-args insn))))
-              (cond
-                ((null kept)
-                 (setf (ir-insn-op insn) :mov)
-                 (setf (ir-insn-args insn) (list '(:imm 0))))
-                ((not (= (length kept) (length (ir-insn-args insn))))
-                 (setf (ir-insn-args insn) kept))))))))
-    prog))
-
 (defun canonicalize-ir (prog)
   "Run cheap canonicalization passes to fixed point.
 
@@ -2188,10 +2145,7 @@
    `prune-stale-phi-args' both BEFORE simplify-cfg (so its
    linear-chain merger sees correctly-trivial vs non-trivial PHIs
    and doesn't drop a non-trivial PHI's dst that's still in use) and
-   AFTER, since the merge also changes the CFG.
-
-   `fix-dangling-branches' is the last-line safety net for branch
-   targets that survive into the emitter despite our best efforts."
+   AFTER, since the merge also changes the CFG."
   (let ((prev-insn-count -1))
     (loop for iteration below 5  ; safety bound
           for insn-count = (loop for b in (ir-program-blocks prog)
@@ -2206,7 +2160,6 @@
              (simplify-cfg prog)
              (compute-cfg-edges prog)
              (prune-stale-phi-args prog)
-             (fix-dangling-branches prog)
              (dead-code-elimination prog)))
   prog)
 
@@ -2253,9 +2206,4 @@
   (split-live-ranges prog)
   ;; Reassert the invariant in case live-range splitting inserted code.
   (ensure-phis-first prog)
-  ;; Last-line safety: any pass above may have removed a block that
-  ;; another block still branches to. Convert the dead-target branch
-  ;; into a return so the emitter's jump-fixup doesn't NPE on a
-  ;; missing label.
-  (fix-dangling-branches prog)
   prog)
