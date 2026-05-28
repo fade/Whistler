@@ -306,6 +306,24 @@
           (when bpf-type
             (values bpf-type nelems size)))))))
 
+(defun btf-type-name (vmbtf type-id)
+  "Return the string name of the BTF type with the given TYPE-ID
+   (e.g. \"vfsmount\" for a struct, \"u64\" for an int), or NIL if
+   anonymous, out of range, or vmbtf has no record for the id.
+   Skips typedef / const / volatile / restrict wrappers so a
+   `const struct qstr' field still resolves to \"qstr\"."
+  (let* ((types  (vmlinux-btf-types vmbtf))
+         (strtab (vmlinux-btf-strtab vmbtf)))
+    (multiple-value-bind (raw-id _kind) (btf-member-raw-type-id vmbtf type-id)
+      (declare (ignore _kind))
+      (let ((id (or raw-id type-id)))
+        (when (and id (>= id 0) (< id (length types)))
+          (let ((rec (aref types id)))
+            (when rec
+              (let ((name (btf-string strtab (getf rec :name-off))))
+                (when (and name (plusp (length name)))
+                  name)))))))))
+
 (defun btf-ptr-target-type-id (vmbtf type-id)
   "If TYPE-ID resolves through typedefs to a BTF pointer kind, return
    the pointed-to type-id (also resolved past typedefs to its

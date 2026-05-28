@@ -156,7 +156,8 @@
            #:reset-vmlinux-btf-cache
            #:btf-find-func #:btf-func-params #:btf-enum-values
            #:btf-find-struct #:btf-struct-fields #:btf-resolve-array
-           #:btf-ptr-target-type-id #:ensure-vmlinux-btf
+           #:btf-ptr-target-type-id #:btf-type-name
+           #:btf-member-raw-type-id #:ensure-vmlinux-btf
            ;; Memory operations
            #:memset #:memcpy
            ;; User-space iteration

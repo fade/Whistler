@@ -233,9 +233,18 @@
      elide it after compound statements (if/while/block), so the
      separator is optional. *)
   statements     = statement (<ws> (<';'> <ws>)? statement)* (<ws> <';'>)?
-  statement      = if-stmt / while-stmt / let-stmt / return-stmt / assign-stmt / expr-stmt
+  statement      = if-stmt / while-stmt / for-stmt / let-stmt / return-stmt /
+                   break-stmt / continue-stmt / assign-stmt / expr-stmt
   return-stmt    = <'return'> !ident-char <ws> expr?
   while-stmt     = <'while'> !ident-char <ws> <'('> <ws> expr <ws> <')'> <ws> block
+  (* `for $var : start..end { body }' — range-based for loop. The
+     induction variable is scoped to the body. Both bounds are full
+     expressions; we lower to a bounded dotimes plus a guard. The
+     map iteration form (`for $kv : @m { … }') is not yet supported. *)
+  for-stmt       = <'for'> !ident-char <ws> <'$'> ident <ws> <':'> <ws>
+                   expr <ws> <'..'> <ws> expr <ws> block
+  break-stmt     = <'break'> !ident-char
+  continue-stmt  = <'continue'> !ident-char
   (* `let $var;' or `let $var = expr;' — bpftrace's local-var decl.
      For us the bare decl is a no-op (variables are inferred from
      use); the assigning form becomes a regular :assign. *)

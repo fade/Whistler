@@ -15,6 +15,9 @@
 ;;;        | (:interval :unit (:s|:ms|:us|:hz) :count N)
 ;;;
 ;;; stmt   = (:if  :cond expr :then (stmt …) :else (stmt …))
+;;;        | (:while :cond expr :body (stmt …))
+;;;        | (:for   :var NAME :start expr :end expr :body (stmt …))
+;;;        | (:break) | (:continue)
 ;;;        | (:assign :lhs lhs :op KW :rhs expr)
 ;;;        | (:incdec :lhs lhs :op (:inc|:dec))
 ;;;        | (:expr expr)
@@ -123,13 +126,16 @@
                when result collect it))))
 
 (defun norm-function (node)
-  "Convert a function definition into (:function :name … :params (…) :body (…))."
+  "Convert a function definition into (:function :name … :params (…) :body (…)).
+   Function params are always written `$name'; we store them as \"$name\"
+   to match the substitution dispatch in codegen.lisp."
   (let* ((name-node  (first-tagged node :ident))
          (params-node (first-tagged node :param-list))
          (block-node  (first-tagged node :block))
          (params (when params-node
                    (loop for p in (all-tagged params-node :param)
-                         collect (text-of (first-tagged p :ident))))))
+                         collect (concatenate 'string "$"
+                                              (text-of (first-tagged p :ident)))))))
     (list :function
           :name (text-of name-node)
           :params params
@@ -137,9 +143,12 @@
 
 (defun norm-macro (node)
   "Convert a `macro NAME(params) { body }' declaration into the same
-   shape as :function so the codegen can reuse the user-fn inline
-   path. Each param is rendered as either \"$NAME\" or \"@NAME\" —
-   the leading sigil tells codegen which substitution form to use."
+   shape as :function so the codegen can reuse the user-fn inline path.
+   Each param is rendered with its sigil — \"$name\", \"@name\", or
+   bare \"name\" — so substitute-vars can dispatch unambiguously:
+   `$name' params match (:var NAME) only, bare `name' params match
+   (:constant NAME) / (:builtin :NAME), and `@name' params match
+   (:map :name NAME …)."
   (let* ((name-node   (first-tagged node :ident))
          (params-node (first-tagged node :macro-param-list))
          (block-node  (first-tagged node :block))
@@ -148,9 +157,14 @@
              (loop for p in (all-tagged params-node :macro-param)
                    for ident = (text-of (first-tagged p :ident))
                    for raw   = (text-of p)
-                   collect (if (and (plusp (length raw)) (char= (char raw 0) #\@))
-                               (concatenate 'string "@" ident)
-                               ident)))))
+                   for sigil = (cond ((zerop (length raw)) #\Space)
+                                     ((char= (char raw 0) #\@) #\@)
+                                     ((char= (char raw 0) #\$) #\$)
+                                     (t nil))
+                   collect (case sigil
+                             (#\@ (concatenate 'string "@" ident))
+                             (#\$ (concatenate 'string "$" ident))
+                             (t   ident))))))
     (list :macro
           :name (text-of name-node)
           :params params
@@ -263,6 +277,22 @@
               (cond-expr (norm-expr-or-expr-wrapped (first kids)))
               (body      (norm-block (second kids))))
          (list :while :cond cond-expr :body body)))
+      (:for-stmt
+       (let* ((ident-node (first-tagged inner :ident))
+              (name       (text-of ident-node))
+              (block-node (first-tagged inner :block))
+              (exprs      (loop for c in (children-of inner)
+                                when (and (consp c)
+                                          (not (member (tag-of c)
+                                                       '(:ident :block))))
+                                  collect c)))
+         (list :for
+               :var name
+               :start (norm-expr-or-expr-wrapped (first exprs))
+               :end   (norm-expr-or-expr-wrapped (second exprs))
+               :body  (norm-block block-node))))
+      (:break-stmt    '(:break))
+      (:continue-stmt '(:continue))
       (:let-stmt
        ;; let $x;          → no-op (drop)
        ;; let $x = expr;   → (:assign (:var "x") := expr)

@@ -1573,49 +1573,99 @@
 
         ;; Sub-pass C: Merge linear chains
         ;; If A's only successor is B (via :br), and B's only predecessor is A
+        ;; we splice B into A and remove B.
+        ;;
+        ;; Correctness: after a merge, succs/preds of *other* blocks
+        ;; become stale. Subsequent merges in the same sweep would
+        ;; reason from those stale counts and could merge two blocks
+        ;; whose predecessor count is actually >1, leaving downstream
+        ;; PHIs / branches referencing the merged-away label. So we
+        ;; do *one* merge per pass and let the outer `while changed'
+        ;; loop re-enter, which re-runs compute-cfg-edges with fresh
+        ;; data. O(N²) on chains, but correctness wins.
         (compute-cfg-edges prog)
-        (dolist (block (ir-program-blocks prog))
-          (when (and (= 1 (length (basic-block-succs block)))
-                     (let ((term (car (last (basic-block-insns block)))))
-                       (and term (eq (ir-insn-op term) :br))))
-            (let* ((succ-label (first (basic-block-succs block)))
-                   (succ (ir-find-block prog succ-label)))
-              (when (and succ
-                         (= 1 (length (basic-block-preds succ)))
-                         ;; Don't merge entry into nothing
-                         (not (eq succ block)))
-                ;; Build substitution map from trivial PHIs
-                (let ((subst-map (make-hash-table)))
-                  (dolist (insn (basic-block-insns succ))
-                    (when (and (eq (ir-insn-op insn) :phi)
-                               (= 1 (length (ir-insn-args insn))))
-                      (let ((incoming-vreg (first (first (ir-insn-args insn)))))
-                        (setf (gethash (ir-insn-dst insn) subst-map) incoming-vreg))))
-                  ;; Remove A's terminator :br
-                  (setf (basic-block-insns block)
-                        (butlast (basic-block-insns block)))
-                  ;; Append B's non-phi instructions to A, substituting PHI values
-                  (dolist (insn (basic-block-insns succ))
-                    (unless (eq (ir-insn-op insn) :phi)
-                      (when (> (hash-table-count subst-map) 0)
-                        (setf (ir-insn-args insn)
-                              (subst-vreg-args (ir-insn-args insn) subst-map))
-                        (when (and (ir-insn-dst insn)
-                                   (gethash (ir-insn-dst insn) subst-map))
-                          ;; Should not happen but be safe
-                          (remhash (ir-insn-dst insn) subst-map)))
-                      (setf (basic-block-insns block)
-                            (append (basic-block-insns block) (list insn)))))
-                  ;; Apply PHI substitutions across all blocks
-                  (when (> (hash-table-count subst-map) 0)
-                    (dolist (b (ir-program-blocks prog))
-                      (dolist (insn (basic-block-insns b))
-                        (setf (ir-insn-args insn)
-                              (subst-vreg-args (ir-insn-args insn) subst-map)))))
-                  ;; Remove B from program
-                  (setf (ir-program-blocks prog)
-                        (remove succ (ir-program-blocks prog)))
-                  (setf changed t))))))
+        (block pass-c
+          (dolist (block (ir-program-blocks prog))
+            (when (and (= 1 (length (basic-block-succs block)))
+                       (let ((term (car (last (basic-block-insns block)))))
+                         (and term (eq (ir-insn-op term) :br))))
+              (let* ((succ-label (first (basic-block-succs block)))
+                     (succ (ir-find-block prog succ-label)))
+                (when (and succ
+                           (= 1 (length (basic-block-preds succ)))
+                           ;; Don't merge entry into nothing
+                           (not (eq succ block))
+                           ;; Refuse to merge if succ has any
+                           ;; non-trivial PHIs (>1 arg). Such a PHI's
+                           ;; existence is itself evidence that the
+                           ;; CFG and PHI invariants are out of sync
+                           ;; (a single-pred block cannot legitimately
+                           ;; have multi-arg PHIs). Dropping it would
+                           ;; leave its dst vreg undefined for any
+                           ;; downstream user.
+                           (every (lambda (insn)
+                                    (or (not (eq (ir-insn-op insn) :phi))
+                                        (= 1 (length (ir-insn-args insn)))))
+                                  (basic-block-insns succ)))
+                  ;; Build substitution map from trivial PHIs
+                  (let ((subst-map (make-hash-table)))
+                    (dolist (insn (basic-block-insns succ))
+                      (when (and (eq (ir-insn-op insn) :phi)
+                                 (= 1 (length (ir-insn-args insn))))
+                        (let ((incoming-vreg (first (first (ir-insn-args insn)))))
+                          (setf (gethash (ir-insn-dst insn) subst-map) incoming-vreg))))
+                    ;; Remove A's terminator :br
+                    (setf (basic-block-insns block)
+                          (butlast (basic-block-insns block)))
+                    ;; Append B's non-phi instructions to A, substituting PHI values
+                    (dolist (insn (basic-block-insns succ))
+                      (unless (eq (ir-insn-op insn) :phi)
+                        (when (> (hash-table-count subst-map) 0)
+                          (setf (ir-insn-args insn)
+                                (subst-vreg-args (ir-insn-args insn) subst-map))
+                          (when (and (ir-insn-dst insn)
+                                     (gethash (ir-insn-dst insn) subst-map))
+                            ;; Should not happen but be safe
+                            (remhash (ir-insn-dst insn) subst-map)))
+                        (setf (basic-block-insns block)
+                              (append (basic-block-insns block) (list insn)))))
+                    ;; Apply PHI substitutions across all blocks
+                    (when (> (hash-table-count subst-map) 0)
+                      (dolist (b (ir-program-blocks prog))
+                        (dolist (insn (basic-block-insns b))
+                          (setf (ir-insn-args insn)
+                                (subst-vreg-args (ir-insn-args insn) subst-map)))))
+                    ;; Re-target any reference to succ's label in the
+                    ;; rest of the program: B was removed but other
+                    ;; blocks' terminator branches and PHIs may still
+                    ;; name it. Rewrite to A's label so the patched
+                    ;; instructions resolve, and so PHIs in B's old
+                    ;; successors see A as the predecessor.
+                    (let ((a-label (basic-block-label block))
+                          (b-label (basic-block-label succ)))
+                      (dolist (b (ir-program-blocks prog))
+                        (unless (eq b succ)
+                          (dolist (insn (basic-block-insns b))
+                            (setf (ir-insn-args insn)
+                                  (mapcar (lambda (arg)
+                                            (cond
+                                              ((and (consp arg) (eq (first arg) :label)
+                                                    (eq (second arg) b-label))
+                                               (list :label a-label))
+                                              ((and (consp arg) (consp (cdr arg))
+                                                    (consp (second arg))
+                                                    (eq (first (second arg)) :label)
+                                                    (eq (second (second arg)) b-label))
+                                               (list (first arg) (list :label a-label)))
+                                              (t arg)))
+                                          (ir-insn-args insn)))))))
+                    ;; Remove B from program
+                    (setf (ir-program-blocks prog)
+                          (remove succ (ir-program-blocks prog)))
+                    (setf changed t)
+                    ;; Exit the sweep so the outer loop can refresh
+                    ;; compute-cfg-edges before any further merges.
+                    (return-from pass-c)))))))
 
         ;; Sub-pass D: Remove unreachable blocks
         (when changed
@@ -1977,11 +2027,16 @@
   prog))
 
 (defun ir-well-formed-p (prog)
-  "Return T if every vreg used in PROG has a defining instruction.
-   Used as a cheap safety gate to reject backend candidates that would
-   produce BPF verifier 'Rn !read_ok' errors."
-  (let ((defs (make-hash-table)))
+  "Return T if PROG is structurally sound for the emitter:
+     (1) every vreg used has a defining instruction (catches
+         `Rn !read_ok' verifier failures), AND
+     (2) every (:label …) referenced by a branch or PHI arg names
+         a block that is still in IR-PROGRAM-BLOCKS (catches
+         dangling targets that would NPE in the jump-fixup pass)."
+  (let ((defs   (make-hash-table))
+        (labels (make-hash-table)))
     (dolist (block (ir-program-blocks prog))
+      (setf (gethash (basic-block-label block) labels) t)
       (dolist (insn (basic-block-insns block))
         (when (ir-insn-dst insn)
           (setf (gethash (ir-insn-dst insn) defs) t))))
@@ -1989,7 +2044,19 @@
       (dolist (insn (basic-block-insns block))
         (dolist (vreg (ir-insn-all-vreg-uses insn))
           (unless (gethash vreg defs)
-            (return-from ir-well-formed-p nil)))))
+            (return-from ir-well-formed-p nil)))
+        (dolist (arg (ir-insn-args insn))
+          (cond
+            ;; Plain branch target.
+            ((and (consp arg) (eq (first arg) :label))
+             (unless (gethash (second arg) labels)
+               (return-from ir-well-formed-p nil)))
+            ;; PHI operand: (vreg (:label …)).
+            ((and (consp arg) (integerp (first arg))
+                  (consp (cdr arg)) (consp (second arg))
+                  (eq (first (second arg)) :label))
+             (unless (gethash (second (second arg)) labels)
+               (return-from ir-well-formed-p nil)))))))
     t))
 
 (defun ensure-phis-first (prog)
@@ -2033,8 +2100,98 @@
 
 ;;; ========== Run all SSA optimizations ==========
 
+(defun prune-stale-phi-args (prog)
+  "After a CFG-mutating pass, walk every PHI and drop args whose
+   incoming label is no longer in the containing block's predecessor
+   set. Sub-pass A (fold-constant-br-cond) and the sub-pass-C merger
+   change the CFG without rewriting affected PHIs — without this
+   pass their dst vregs survive into downstream uses but their
+   defining args reference deleted predecessors. Assumes
+   compute-cfg-edges has already populated the current preds lists.
+
+   When pruning leaves a PHI with one operand it becomes trivial; we
+   convert it to a :mov so subsequent passes copy-propagate through
+   it. An empty PHI (every pred dropped) is unreachable code by
+   construction, but we still rewrite it to (:mov dst (:imm 0)) so
+   downstream uses don't fault."
+  (dolist (block (ir-program-blocks prog))
+    (let ((preds (basic-block-preds block)))
+      (dolist (insn (basic-block-insns block))
+        (when (eq (ir-insn-op insn) :phi)
+          (let ((kept (remove-if-not
+                        (lambda (arg)
+                          (and (consp arg) (consp (cdr arg))
+                               (consp (second arg))
+                               (eq (first (second arg)) :label)
+                               (member (second (second arg)) preds)))
+                        (ir-insn-args insn))))
+            (cond
+              ((null kept)
+               (setf (ir-insn-op insn) :mov)
+               (setf (ir-insn-args insn) (list '(:imm 0))))
+              ((= 1 (length kept))
+               (setf (ir-insn-op insn) :mov)
+               (setf (ir-insn-args insn) (list (first (first kept)))))
+              ((/= (length kept) (length (ir-insn-args insn)))
+               (setf (ir-insn-args insn) kept))))))))
+  prog)
+
+(defun fix-dangling-branches (prog)
+  "Defence-in-depth: rewrite branches whose target label has been
+   removed into a :ret (:imm 0), and drop PHI operands that
+   reference a missing label. The target is unreachable by
+   construction (otherwise the predecessor would still exist), so
+   returning 0 is semantically equivalent.
+
+   With simplify-cfg's sub-pass C now performing one merge per sweep
+   and rewriting label references in surviving blocks, this pass
+   should rarely fire on first-party code. Kept as a safety net so a
+   future optimizer change can't crash the emitter."
+  (let ((labels (make-hash-table)))
+    (dolist (b (ir-program-blocks prog))
+      (setf (gethash (basic-block-label b) labels) t))
+    (dolist (b (ir-program-blocks prog))
+      (let* ((insns (basic-block-insns b))
+             (term  (car (last insns))))
+        (when (and term (member (ir-insn-op term) '(:br :br-cond)))
+          (let ((has-dangling nil))
+            (dolist (arg (ir-insn-args term))
+              (when (and (consp arg) (eq (first arg) :label)
+                         (not (gethash (second arg) labels)))
+                (setf has-dangling t)))
+            (when has-dangling
+              (setf (ir-insn-op term) :ret)
+              (setf (ir-insn-args term) (list '(:imm 0))))))
+        (dolist (insn insns)
+          (when (eq (ir-insn-op insn) :phi)
+            (let ((kept (remove-if-not
+                          (lambda (arg)
+                            (and (consp arg) (integerp (first arg))
+                                 (consp (second arg))
+                                 (eq (first (second arg)) :label)
+                                 (gethash (second (second arg)) labels)))
+                          (ir-insn-args insn))))
+              (cond
+                ((null kept)
+                 (setf (ir-insn-op insn) :mov)
+                 (setf (ir-insn-args insn) (list '(:imm 0))))
+                ((not (= (length kept) (length (ir-insn-args insn))))
+                 (setf (ir-insn-args insn) kept))))))))
+    prog))
+
 (defun canonicalize-ir (prog)
-  "Run cheap canonicalization passes to fixed point."
+  "Run cheap canonicalization passes to fixed point.
+
+   Invariant maintained between sub-passes: every PHI's label-args
+   reference labels in the containing block's actual predecessor set,
+   computed from terminator branches. We restore this invariant via
+   `prune-stale-phi-args' both BEFORE simplify-cfg (so its
+   linear-chain merger sees correctly-trivial vs non-trivial PHIs
+   and doesn't drop a non-trivial PHI's dst that's still in use) and
+   AFTER, since the merge also changes the CFG.
+
+   `fix-dangling-branches' is the last-line safety net for branch
+   targets that survive into the emitter despite our best efforts."
   (let ((prev-insn-count -1))
     (loop for iteration below 5  ; safety bound
           for insn-count = (loop for b in (ir-program-blocks prog)
@@ -2044,7 +2201,12 @@
              (copy-propagation prog)
              (constant-propagation prog)
              (eliminate-trivial-phis prog)
+             (compute-cfg-edges prog)
+             (prune-stale-phi-args prog)
              (simplify-cfg prog)
+             (compute-cfg-edges prog)
+             (prune-stale-phi-args prog)
+             (fix-dangling-branches prog)
              (dead-code-elimination prog)))
   prog)
 
@@ -2091,4 +2253,9 @@
   (split-live-ranges prog)
   ;; Reassert the invariant in case live-range splitting inserted code.
   (ensure-phis-first prog)
+  ;; Last-line safety: any pass above may have removed a block that
+  ;; another block still branches to. Convert the dead-target branch
+  ;; into a return so the emitter's jump-fixup doesn't NPE on a
+  ;; missing label.
+  (fix-dangling-branches prog)
   prog)

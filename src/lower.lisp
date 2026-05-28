@@ -634,6 +634,18 @@
 ;;; ========== If ==========
 
 (defun lower-if (ctx test then-form else-form)
+  ;; Constant-test fold: a literal integer test always selects one
+  ;; branch, so lower only that branch in-line. Without this, the
+  ;; downstream optimizer collapses the dead block but can leave the
+  ;; entry's terminator pointing at a removed label, which then
+  ;; trips the emitter's jump-fixup pass with a NIL target offset.
+  ;; This commonly fires for `(if 0 …)' that bpftrace lowers from a
+  ;; constant getopt(name, false, …) reference.
+  (when (integerp test)
+    (return-from lower-if
+      (lower-expr ctx (if (zerop test)
+                          (or else-form 0)
+                          (or then-form 0)))))
   (let* ((prog (lower-ctx-prog ctx))
          (then-label (ir-fresh-label prog "then"))
          (else-label (ir-fresh-label prog "else"))

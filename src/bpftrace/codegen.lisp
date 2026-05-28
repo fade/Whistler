@@ -315,6 +315,16 @@
                           (minfo-value-size info)
                           (max (minfo-value-size info)
                                +bt-ntop-slot-size+)))
+                   ;; `@m[k] = str(ptr)' / `kstr(ptr)' — probe-read a
+                   ;; NUL-terminated string into the value slot. Size
+                   ;; from the optional second arg, else default len.
+                   ((and (consp rhs) (eq (first rhs) :call)
+                         (or (str-call-p rhs) (kstr-call-p rhs)))
+                    (setf (minfo-kind info) :scalar
+                          (minfo-value-string-p info) t
+                          (minfo-value-size info)
+                          (max (minfo-value-size info)
+                               (str-key-size rhs))))
                    ((and (consp rhs) (eq (first rhs) :call))
                     (let ((fn (getf (cdr rhs) :name)))
                       (cond
@@ -387,17 +397,25 @@
                                   :keys (rest args))))
                           (t (note-keys mref))))))))
                ;; Recurse into compound statements so map references
-               ;; nested under if/while still get inferred.
+               ;; nested under if/while/for still get inferred.
                (:if
                 (mapc #'scan-stmt (getf (cdr stmt) :then))
                 (mapc #'scan-stmt (getf (cdr stmt) :else)))
                (:while
+                (mapc #'scan-stmt (getf (cdr stmt) :body)))
+               (:for
                 (mapc #'scan-stmt (getf (cdr stmt) :body))))))
         (dolist (probe (script-probes script))
           (let ((body (getf (cdr probe) :body))
                 (pred (getf (cdr probe) :predicate)))
             (when pred (when (eq (first pred) :map) (note-keys pred)))
-            (mapc #'scan-stmt body))))
+            (mapc #'scan-stmt body)))
+        ;; Also walk macro/fn bodies so map references inside
+        ;; them (e.g. `@paths[k] = str(p)' in opensnoop's getcwd
+        ;; macro) tag the value slot — the macro inliner runs at
+        ;; lower time, after this pass.
+        (dolist (defn (script-functions script))
+          (mapc #'scan-stmt (getf (cdr defn) :body))))
       ;; Histogram maps with no explicit user key always have 4-byte key.
       (loop for info being the hash-values of table
             when (or (eq (minfo-kind info) :hist)
@@ -451,6 +469,14 @@
    and comparisons against a string literal use byte-by-byte equality
    (same path as the existing bare-`comm' compare).")
 
+(defvar *str-vars* nil
+  "Per-probe alist VAR-NAME → BUFFER-SIZE for vars assigned from a
+   `str(…)' or `kstr(…)' call (or from reading a string-valued map
+   slot). Each is backed by a BUFFER-SIZE-byte stack slot so
+   probe-read-{user,kernel}-str can populate it and \`printf(\"%s\",
+   \$v)' can emit the bytes. Indexing (`\$v[i]') reads u8 at offset
+   i from the buffer.")
+
 (defvar *string-set-buf* nil
   "Per-probe scratch buffer symbol shared across all
    `gen-string-set' calls in the same probe. The BPF stack frame
@@ -463,6 +489,82 @@
   "Width of the buffer named by *string-set-buf*; equal to the
    largest string-typed value-size of any map referenced from the
    current probe. Sized at gen-kernel-prog setup time.")
+
+;;; ========== Per-CPU scratch map ==========
+;;;
+;;; The BPF stack frame is capped at 512 bytes. Non-trivial bpftrace
+;;; tools (opensnoop's sys_exit with for-loop, multiple str() $vars,
+;;; chained struct walks) blow that budget if every `struct-alloc' goes
+;;; to the stack. We mirror what bpftrace + libbpf do: spill anything
+;;; over a small threshold into a per-CPU BPF_MAP_TYPE_PERCPU_ARRAY,
+;;; max_entries=1, value_size = max-probe-need bytes. Per-CPU storage
+;;; means no contention; a single map_lookup at probe entry returns the
+;;; CPU-local buffer pointer and every spilled alloc becomes
+;;; `(+ scratch-base compile-time-offset)'.
+
+(defconstant +bt-scratch-threshold+ 32
+  "struct-alloc requests larger than this go to the per-CPU scratch
+   map rather than the BPF stack. Matches bpftrace's on_stack_limit
+   default and gives us roughly the same stack/scratch split.")
+
+(defvar *bt-scratch-map-name* (intern "--BT-SCRATCH--" :whistler)
+  "Symbol naming the auto-defined per-CPU scratch array map.")
+
+(defvar *scratch-allocations* nil
+  "Per-probe alist of (TAG . SIZE) for every large struct-alloc
+   the rewriter intercepted in this probe. Populated by
+   rewrite-large-struct-allocs, consumed by the layout step that
+   assigns each TAG an offset within the per-CPU scratch buffer.")
+
+(defvar *scratch-base-sym* nil
+  "Per-probe gensym bound at probe entry to the result of looking up
+   the scratch map's per-CPU slot. NIL outside a probe or when no
+   spilled allocs were rewritten.")
+
+(defvar *max-scratch-bytes* 0
+  "Per-generate() maximum of `(probe-scratch-bytes …)' across all
+   probes. Sets the auto-defined scratch map's value-size.")
+
+(defun rewrite-large-struct-allocs (form)
+  "Walk a lowered probe body. Replace each (whistler::struct-alloc N)
+   with N > +bt-scratch-threshold+ by a marker (:bt-scratch-slot TAG N)
+   for later offset-substitution, and record (TAG . N) into
+   *scratch-allocations*. Small struct-allocs pass through unchanged
+   and continue to use the BPF stack."
+  (cond
+    ((not (consp form)) form)
+    ((and (eq (first form) (intern "STRUCT-ALLOC" :whistler))
+          (integerp (second form))
+          (> (second form) +bt-scratch-threshold+))
+     (let ((tag (gensym "BT-SCR-"))
+           (size (second form)))
+       (push (cons tag size) *scratch-allocations*)
+       (list :bt-scratch-slot tag size)))
+    (t (cons (rewrite-large-struct-allocs (first form))
+             (rewrite-large-struct-allocs (rest form))))))
+
+(defun substitute-scratch-offsets (form offsets)
+  "Walk FORM and replace each (:bt-scratch-slot TAG SIZE) marker with
+   (whistler::+ *scratch-base-sym* OFFSET) using OFFSETS, an alist
+   (TAG . OFFSET) computed once per probe after rewriting."
+  (cond
+    ((not (consp form)) form)
+    ((and (eq (first form) :bt-scratch-slot)
+          (assoc (second form) offsets))
+     `(whistler::+ ,*scratch-base-sym*
+                   ,(cdr (assoc (second form) offsets))))
+    (t (cons (substitute-scratch-offsets (first form) offsets)
+             (substitute-scratch-offsets (rest form) offsets)))))
+
+(defun assign-scratch-offsets (allocations)
+  "Lay each (TAG . SIZE) out back-to-back. Returns (offsets-alist
+   total-bytes). Order is preserved so identical bodies get identical
+   layouts — easier on the diff and on the BPF verifier's cache."
+  (let ((offsets nil) (off 0))
+    (dolist (pair (reverse allocations))
+      (push (cons (car pair) off) offsets)
+      (incf off (cdr pair)))
+    (values (nreverse offsets) off)))
 
 (defconstant +bt-ntop-slot-size+ 17
   "1 byte family + 16 bytes address — covers both AF_INET and AF_INET6.")
@@ -524,7 +626,7 @@
     (:tern       (lower-tern expr))
     (:call       (lower-call expr))
     (:field      (lower-field expr))
-    (:index      (unsupported "array indexing outside @maps"))
+    (:index      (lower-index expr))
     (:map        (lower-map-read expr))))
 
 ;;; ========== Script top-form helpers ==========
@@ -936,36 +1038,52 @@
             do (unless (and (consp a) (eq (first a) :map))
                  (unsupported "macro ~A: param ~A wants an @-map, got ~S"
                               name p a)))
-    (let* ((body* (mapcar (lambda (s) (substitute-vars s subs)) body))
-           (forms (mapcar #'lower-fn-stmt body*)))
-      ;; Single trailing :return → its expression IS the result.
-      ;; Multiple forms → wrap in progn; the last form's value wins.
-      (cond
-        ((null forms) 0)
-        ((= (length forms) 1) (first forms))
-        (t `(progn ,@forms))))))
+    (let* ((body* (mapcar (lambda (s) (substitute-vars s subs)) body)))
+      ;; Macro bodies aren't visible to the per-probe inference pass —
+      ;; type/ntop/comm/tuple-var maps were built before macros were
+      ;; expanded. Extend the dynamic vars in place so $vars assigned
+      ;; in the macro body (e.g. `$dentry = curtask.fs.pwd.dentry;')
+      ;; are typed before their .field uses lower. Pushed to the
+      ;; *front* so the macro's bindings shadow any earlier ones.
+      (let ((new-types  (infer-var-types body*))
+            (new-tuples (infer-tuple-vars body*))
+            (new-ntop   (infer-ntop-vars body*))
+            (new-comm   (infer-comm-vars body*))
+            (new-str    (infer-str-vars body*)))
+        (when new-types  (setf *var-types*  (append new-types  *var-types*)))
+        (when new-tuples (setf *tuple-vars* (append new-tuples *tuple-vars*)))
+        (when new-ntop   (setf *ntop-vars*  (append new-ntop   *ntop-vars*)))
+        (when new-comm   (setf *comm-vars*  (append new-comm   *comm-vars*)))
+        (when new-str    (setf *str-vars*   (append new-str    *str-vars*))))
+      (let ((forms (mapcar #'lower-fn-stmt body*)))
+        ;; Single trailing :return → its expression IS the result.
+        ;; Multiple forms → wrap in progn; the last form's value wins.
+        (cond
+          ((null forms) 0)
+          ((= (length forms) 1) (first forms))
+          (t `(progn ,@forms)))))))
 
 (defun substitute-vars (form subs)
-  "Walk FORM (an AST), substituting parameter references:
-     * `$name'  → matches (:var NAME); replaced wholesale.
-     * bare `name' (macro param without sigil) → matches both
-       (:var NAME) AND (:builtin :NAME); replaced wholesale.
-     * `@name'  → matches (:map :name NAME …); :name is rewritten to
-       the actual map's name and :keys is preserved from the body."
+  "Walk FORM (an AST), substituting parameter references. SUBS is an
+   alist keyed by the param's sigilled name:
+     * `$name' param ←→ (:var NAME)
+     * bare `name' param ←→ (:constant NAME) or (:builtin :NAME)
+     * `@name' param ←→ (:map :name NAME …) — :name is rewritten to
+       the actual map's name and :keys is preserved from the body.
+   No conflation: `$ret' and bare `ret' look up under different keys
+   so a macro body can keep them distinct."
   (cond
     ((not (consp form)) form)
     ((and (eq (first form) :var) (stringp (second form)))
-     (let ((cell (assoc (second form) subs :test #'string=)))
+     (let ((cell (assoc (concatenate 'string "$" (second form))
+                        subs :test #'string=)))
        (cond (cell (cdr cell))
              (t form))))
-    ;; Bare-name macro params: (:builtin :NAME) keyword form.
     ((and (eq (first form) :builtin) (keywordp (second form)))
      (let* ((sname (string-downcase (symbol-name (second form))))
             (cell  (assoc sname subs :test #'string=)))
        (cond (cell (cdr cell))
              (t form))))
-    ;; Bare-name macro params: (:constant "name") string form
-    ;; (lowercase idents that didn't match a builtin name).
     ((and (eq (first form) :constant) (stringp (second form)))
      (let ((cell (assoc (second form) subs :test #'string=)))
        (cond (cell (cdr cell))
@@ -1286,6 +1404,9 @@
             (n    (when (and (cdr args) (eq (first (second args)) :int))
                     (second (second args)))))
        (cons :string (or n +bt-str-default-len+))))
+    ;; `strerror(errno-expr)' — kernel emits the integer; userspace
+    ;; runs it through strerror(3) at print time.
+    ((named-call-p expr "strerror") :strerror)
     ;; A bare string literal (produced by rewrite-self-refs for
     ;; probe/func, or by the user writing printf("x", "y")) lands as
     ;; a fixed-size NUL-padded slot just long enough to hold it.
@@ -1348,6 +1469,7 @@
     ((eq arg-type :ipv-any) +bt-ntop-slot-size+)
     ((eq arg-type :cgroup-path) 8)
     ((eq arg-type :buf) (+ 4 +bt-buf-max-len+))
+    ((eq arg-type :strerror) 4)  ; the errno as u32; userspace strerror(3)s it
     ((and (consp arg-type) (eq (car arg-type) :string))   (cdr arg-type))
     ((and (consp arg-type) (eq (car arg-type) :strftime)) 8)  ; just the u64 timestamp
     (t (error "printf-arg-size: unrecognised ~A" arg-type))))
@@ -1415,6 +1537,11 @@
      (let* ((args (getf (cdr arg) :args))
             (addr-expr (lower-expr (if (cdr args) (second args) (first args)))))
        `(whistler::store ,(intern "U32" :whistler) ,rec ,off ,addr-expr)))
+    ((eq ty :strerror)
+     ;; Emit the errno as u32. Userspace runs strerror(3) on the
+     ;; value at decode time and substitutes the result for %s.
+     (let ((errno-expr (lower-expr (first (getf (cdr arg) :args)))))
+       `(whistler::store ,(intern "U32" :whistler) ,rec ,off ,errno-expr)))
     ((and (consp ty) (eq (car ty) :strftime))
      ;; Store the timestamp as a u64; the format-id is implicit in
      ;; the printf-table's per-arg type list.
@@ -1670,9 +1797,13 @@
             (incf segment-offset offset)
             (cond
               ;; Embedded struct/union — keep walking by type-id, no
-              ;; new probe-read needed.
+              ;; new probe-read needed. Unwrap typedef/const/volatile
+              ;; so the next iteration sees the actual struct rec,
+              ;; not a const-wrapper whose vlen is 0.
               ((and (null bpf-type) sub-name (not (leaf? fname)))
-               (setf current-tid sub-tid))
+               (setf current-tid
+                     (or (whistler:btf-member-raw-type-id vmbtf sub-tid)
+                         sub-tid)))
               ;; Pointer-typed field, not at leaf — dereference and
               ;; continue from the pointed-to struct.
               ((and (eql size 8) (stringp sub-name) (string= sub-name "ptr")
@@ -1740,10 +1871,14 @@
                (whistler::load ,type-sym ,scratch 0))))))))
 
 (defun lower-args-field (name)
-  "Lower args->NAME based on the current probe type. Tracepoints use
-   the deftracepoint-generated tp-NAME accessor; fentry/fexit
-   programs read the named arg directly out of the ctx array using
-   the offset BTF gives us."
+  "Lower args->NAME based on the current probe type. Tracepoints
+   read the field directly from the kernel-provided ctx using the
+   per-tracepoint format file — every tracepoint's args layout is
+   unique (e.g. sys_enter_open has filename at offset 16 but
+   sys_enter_openat at offset 24, with dfd occupying 16). A shared
+   `tp-NAME' macro across tracepoints would silently load from the
+   wrong offset; resolving per-probe via *probe-spec* fixes that.
+   fentry/fexit programs walk BTF for their named params."
   (case (first *probe-spec*)
     ((:kfunc :kretfunc)
      (let* ((fname  (second *probe-spec*))
@@ -1754,6 +1889,37 @@
          (unsupported "args->~A: ~A has no such parameter (have: ~{~A~^, ~})"
                       name fname (mapcar #'car params)))
        `(whistler::ctx ,(intern "U64" :whistler) ,(cdr cell))))
+    (:tracepoint
+     (let* ((cat   (second *probe-spec*))
+            (event (third  *probe-spec*))
+            (path  (ignore-errors
+                    (whistler::find-tracepoint-format-path cat event)))
+            (fields (when path
+                      (ignore-errors
+                       (whistler::parse-tracepoint-format (namestring path)))))
+            (c-name (substitute #\_ #\- name))
+            (field (find c-name fields :key #'first :test #'string=)))
+       (cond
+         (field
+          (destructuring-bind (c-name offset size signed-p array-size) field
+            (declare (ignore c-name))
+            (let ((type (whistler::tracepoint-type size signed-p array-size)))
+              (cond
+                (type `(whistler::ctx ,type ,offset))
+                ((plusp array-size)
+                 `(whistler::+ (whistler::ctx-ptr) ,offset))
+                (t (unsupported "args.~A: unrecognised field shape" name))))))
+         ;; Format file not readable at compile time — fall back to
+         ;; the shared `(tp-NAME)' macro that gen-deftracepoint-preamble
+         ;; emits. The deftracepoint expansion at load time reads the
+         ;; format file (which the loader is running as root for) and
+         ;; defines the macro. This path silently mis-handles cases
+         ;; where multiple tracepoints in the same script share a
+         ;; field name with differing offsets (e.g. sys_enter_open /
+         ;; sys_enter_openat both define `filename') — only the first
+         ;; tracepoint's offset wins. We rely on compile-time format
+         ;; access (the path above) to handle that correctly.
+         (t (list (w-sym (concatenate 'string "tp-" name)))))))
     (t (list (w-sym (concatenate 'string "tp-" name))))))
 
 (defun store-key-component (buf offset type expr)
@@ -1817,6 +1983,42 @@
     ((= (length keys) 1) (lower-expr (first keys)))
     (t (unsupported "composite keys cannot appear in this position"))))
 
+(defun lower-index (expr)
+  "Lower `BASE[KEY]' for shapes other than @-maps:
+     * \$strvar[i] → u8 load at byte i of the str-buffer.
+     * \$ntopvar[i] → u8 load at byte i of the ntop record.
+     * \$commvar[i] → u8 load at byte i of the comm slot.
+   `\"foo\"[i]' lowers to the i'th character of the literal."
+  (let ((base (getf (cdr expr) :base))
+        (keys (getf (cdr expr) :keys)))
+    (unless (= 1 (length keys))
+      (unsupported "indexed access requires a single integer key"))
+    (let ((idx (first keys)))
+      (cond
+        ((and (consp base) (eq (first base) :str)
+              (consp idx)  (eq (first idx) :int))
+         ;; Literal string index — fold to the character's code.
+         (let ((s (second base)) (i (second idx)))
+           (if (and (>= i 0) (< i (length s)))
+               (char-code (char s i))
+               0)))
+        ((and (consp base) (eq (first base) :var)
+              (assoc (second base) *str-vars* :test #'string-equal))
+         `(whistler::load ,(intern "U8" :whistler)
+                          ,(var-sym (second base))
+                          ,(lower-expr idx)))
+        ((and (consp base) (eq (first base) :var)
+              (member (second base) *comm-vars* :test #'string-equal))
+         `(whistler::load ,(intern "U8" :whistler)
+                          ,(var-sym (second base))
+                          ,(lower-expr idx)))
+        ((and (consp base) (eq (first base) :var)
+              (member (second base) *ntop-vars* :test #'string-equal))
+         `(whistler::load ,(intern "U8" :whistler)
+                          ,(var-sym (second base))
+                          ,(lower-expr idx)))
+        (t (unsupported "array indexing outside @maps"))))))
+
 (defun lower-map-read (expr)
   (let* ((info (or (gethash (or (getf (cdr expr) :name) "@") *map-table*)
                    (unsupported "unknown map @~A" (getf (cdr expr) :name))))
@@ -1828,41 +2030,94 @@
 ;;; ========== Statement lowering ==========
 
 (defun collect-vars (stmts)
-  "Collect every $var name written or read inside STMTS. Returns a list
-   of (canonical) symbols suitable for binding."
-  (let ((seen (make-hash-table :test 'equal)))
-    (labels ((walk (form)
+  "Collect every $var name written or read inside STMTS — including
+   $vars defined inside user macros/functions transitively reachable
+   via calls. Returns a list of (canonical) symbols suitable for
+   binding at probe scope. Macros aren't hygienic in bpftrace: a
+   $tmp inside a macro and a $tmp at the call site share the same
+   binding, so we collect all of them up-front."
+  (let ((seen (make-hash-table :test 'equal))
+        (visited-fns (make-hash-table :test 'equal)))
+    (labels ((collect-call-body (name)
+               (let ((fn (find-user-function name)))
+                 (when (and fn (not (gethash name visited-fns)))
+                   (setf (gethash name visited-fns) t)
+                   ;; Skip the fn's own $-prefixed param names —
+                   ;; those are substituted at inline time, not
+                   ;; real local vars.
+                   (let ((skip (loop for p in (getf fn :params)
+                                     when (and (plusp (length p))
+                                               (char= (char p 0) #\$))
+                                       collect (subseq p 1))))
+                     (let ((sub-seen seen))
+                       (mapc (lambda (s) (walk-stmt s sub-seen skip))
+                             (getf fn :body)))))))
+             (walk (form skip)
                (when (consp form)
                  (case (first form)
-                   (:var (setf (gethash (second form) seen) t))
-                   (:bin   (walk (getf (cdr form) :lhs))
-                           (walk (getf (cdr form) :rhs)))
-                   (:un    (walk (getf (cdr form) :arg)))
-                   (:tern  (walk (getf (cdr form) :cond))
-                           (walk (getf (cdr form) :then))
-                           (walk (getf (cdr form) :else)))
-                   (:call  (dolist (a (getf (cdr form) :args)) (walk a)))
-                   (:field (walk (getf (cdr form) :base)))
-                   (:index (walk (getf (cdr form) :base))
-                           (dolist (k (getf (cdr form) :keys)) (walk k)))
-                   (:map   (dolist (k (getf (cdr form) :keys)) (walk k)))))))
-      (labels ((walk-stmt (s)
-                 (case (first s)
-                   (:if      (walk (getf (cdr s) :cond))
-                             (mapc #'walk-stmt (getf (cdr s) :then))
-                             (mapc #'walk-stmt (getf (cdr s) :else)))
-                   (:assign  (walk (getf (cdr s) :rhs))
-                             (let ((lhs (getf (cdr s) :lhs)))
-                               (when (eq (first lhs) :var)
-                                 (setf (gethash (second lhs) seen) t))
-                               (walk lhs)))
-                   (:incdec  (walk (getf (cdr s) :lhs)))
-                   (:expr    (walk (second s))))))
-        (mapc #'walk-stmt stmts))
-      (loop for k being the hash-keys of seen collect (var-sym k)))))
+                   (:var (let ((name (second form)))
+                           (unless (member name skip :test #'string=)
+                             (setf (gethash name seen) t))))
+                   (:bin   (walk (getf (cdr form) :lhs) skip)
+                           (walk (getf (cdr form) :rhs) skip))
+                   (:un    (walk (getf (cdr form) :arg) skip))
+                   (:tern  (walk (getf (cdr form) :cond) skip)
+                           (walk (getf (cdr form) :then) skip)
+                           (walk (getf (cdr form) :else) skip))
+                   (:call  (dolist (a (getf (cdr form) :args))
+                             (walk a skip))
+                           (collect-call-body (getf (cdr form) :name)))
+                   (:field (walk (getf (cdr form) :base) skip))
+                   (:index (walk (getf (cdr form) :base) skip)
+                           (dolist (k (getf (cdr form) :keys))
+                             (walk k skip)))
+                   (:map   (dolist (k (getf (cdr form) :keys))
+                             (walk k skip))))))
+             (walk-stmt (s _seen skip)
+               (declare (ignore _seen))
+               (case (first s)
+                 (:if      (walk (getf (cdr s) :cond) skip)
+                           (mapc (lambda (x) (walk-stmt x seen skip))
+                                 (getf (cdr s) :then))
+                           (mapc (lambda (x) (walk-stmt x seen skip))
+                                 (getf (cdr s) :else)))
+                 (:while   (walk (getf (cdr s) :cond) skip)
+                           (mapc (lambda (x) (walk-stmt x seen skip))
+                                 (getf (cdr s) :body)))
+                 (:for     (walk (getf (cdr s) :start) skip)
+                           (walk (getf (cdr s) :end) skip)
+                           (mapc (lambda (x) (walk-stmt x seen skip))
+                                 (getf (cdr s) :body)))
+                 (:assign  (walk (getf (cdr s) :rhs) skip)
+                           (let ((lhs (getf (cdr s) :lhs)))
+                             (when (eq (first lhs) :var)
+                               (let ((name (second lhs)))
+                                 (unless (member name skip :test #'string=)
+                                   (setf (gethash name seen) t))))
+                             (walk lhs skip)))
+                 (:incdec  (walk (getf (cdr s) :lhs) skip))
+                 (:expr    (walk (second s) skip)))))
+      (mapc (lambda (s) (walk-stmt s seen nil)) stmts))
+    (loop for k being the hash-keys of seen collect (var-sym k))))
+
+(defvar *loop-break-bf* nil
+  "Gensym for the innermost loop's break flag, or NIL outside any loop.
+   Set inside lower-for / lower-while; read by lower-break.")
+
+(defvar *loop-break-cf* nil
+  "Gensym for the innermost loop's continue flag, or NIL outside any loop.
+   Set inside lower-for / lower-while; read by lower-continue AND by
+   lower-stmts to wrap each statement so the rest of an iteration
+   short-circuits once break/continue fires.")
 
 (defun lower-stmts (stmts)
-  (mapcar #'lower-stmt stmts))
+  "Lower each STMT. When inside a loop (signalled by *LOOP-BREAK-CF*),
+   wrap each result in `(unless cf …)' so statements after a break or
+   continue in the same lexical scope are skipped within an iteration."
+  (let ((cf *loop-break-cf*))
+    (if cf
+        (mapcar (lambda (s) `(whistler::unless ,cf ,(lower-stmt s))) stmts)
+        (mapcar #'lower-stmt stmts))))
 
 (defconstant +bt-max-loop-iters+ 64
   "Upper bound on bpftrace `while' iterations. The BPF verifier
@@ -1873,6 +2128,9 @@
   (ecase (first stmt)
     (:if        (lower-if stmt))
     (:while     (lower-while stmt))
+    (:for       (lower-for stmt))
+    (:break     (lower-break stmt))
+    (:continue  (lower-continue stmt))
     (:assign    (lower-assign stmt))
     (:incdec    (lower-incdec stmt))
     (:expr      (lower-expr-stmt stmt))
@@ -1887,20 +2145,84 @@
 (defun lower-while (stmt)
   "Lower a bpftrace `while (cond) { body }' to a bounded dotimes:
 
-       (dotimes (k +bt-max-loop-iters+)
-         (when cond
-           body…))
+       (let* ((bf 0))
+         (dotimes (k +bt-max-loop-iters+)
+           (unless bf
+             (let* ((cf 0))
+               (when cond
+                 stmt1-wrapped …)))))
 
    The BPF verifier requires a static loop bound; once `cond' goes
-   false the body is skipped on every remaining iteration. Simple
-   and verifier-friendly; bpf_loop()-style early termination is a
-   future optimisation."
+   false the body is skipped on every remaining iteration. The
+   bf/cf flags carry break/continue: `break' sets both, `continue'
+   sets cf; lower-stmts wraps each body statement with `(unless cf
+   …)' so subsequent statements in the same iteration short-circuit."
   (let* ((cond-expr (getf (cdr stmt) :cond))
          (body      (getf (cdr stmt) :body))
-         (k         (gensym "WHILE-K")))
-    `(whistler::dotimes (,k ,+bt-max-loop-iters+)
-       (whistler::when ,(lower-expr cond-expr)
-         ,@(lower-stmts body)))))
+         (k         (gensym "WHILE-K"))
+         (bf        (gensym "WHILE-BF"))
+         (cf        (gensym "WHILE-CF")))
+    (let* ((*loop-break-bf* bf)
+           (*loop-break-cf* cf)
+           (body-forms (lower-stmts body))
+           (cond-form  (lower-expr cond-expr)))
+      `(whistler::let* ((,bf 0))
+         (whistler::dotimes (,k ,+bt-max-loop-iters+)
+           (whistler::unless ,bf
+             (whistler::let* ((,cf 0))
+               (whistler::when ,cond-form
+                 ,@body-forms))))))))
+
+(defun lower-for (stmt)
+  "Lower a bpftrace `for $v : start..end { body }' to a bounded dotimes.
+
+   Shape:
+       (let* ((bf 0))
+         (dotimes (k +bt-max-loop-iters+)
+           (unless bf
+             (let* ((cf 0)
+                    ($v (+ start k)))
+               (when (< $v end)
+                 stmt1-wrapped …)))))
+
+   $v is loop-scoped via the inner let*; it shadows any probe-scope
+   binding of the same name. start/end are evaluated once per
+   iteration — bpftrace's semantics — but the verifier-required
+   static upper bound caps total iterations at +bt-max-loop-iters+."
+  (let* ((vname     (getf (cdr stmt) :var))
+         (start     (getf (cdr stmt) :start))
+         (end       (getf (cdr stmt) :end))
+         (body      (getf (cdr stmt) :body))
+         (k         (gensym "FOR-K"))
+         (bf        (gensym "FOR-BF"))
+         (cf        (gensym "FOR-CF"))
+         (var-sym   (var-sym vname)))
+    (let* ((*loop-break-bf* bf)
+           (*loop-break-cf* cf)
+           (body-forms (lower-stmts body))
+           (start-form (lower-expr start))
+           (end-form   (lower-expr end)))
+      `(whistler::let* ((,bf 0))
+         (whistler::dotimes (,k ,+bt-max-loop-iters+)
+           (whistler::unless ,bf
+             (whistler::let* ((,cf 0)
+                              (,var-sym (whistler::+ ,start-form ,k)))
+               (whistler::when (whistler::< ,var-sym ,end-form)
+                 ,@body-forms))))))))
+
+(defun lower-break (stmt)
+  (declare (ignore stmt))
+  (unless *loop-break-bf*
+    (unsupported "`break' outside of a loop"))
+  ;; Set both flags: bf stops further iterations, cf skips the rest
+  ;; of the current one.
+  `(whistler::setf ,*loop-break-bf* 1 ,*loop-break-cf* 1))
+
+(defun lower-continue (stmt)
+  (declare (ignore stmt))
+  (unless *loop-break-cf*
+    (unsupported "`continue' outside of a loop"))
+  `(whistler::setf ,*loop-break-cf* 1))
 
 (defun lower-if (stmt)
   (let ((c (lower-expr (getf (cdr stmt) :cond)))
@@ -1947,6 +2269,23 @@
                  (consp rhs) (eq (first rhs) :map)
                  (member (second lhs) *comm-vars* :test #'string-equal))
             (lower-string-map-copy sym rhs))
+           ;; `$v = str(ptr[, len])' / `kstr(ptr[, len])' on a str-typed
+           ;; $v — probe-read the NUL-terminated string from ptr into
+           ;; $v's pre-allocated buffer. str() goes through user-str;
+           ;; kstr() through kernel-str.
+           ((and (eq op :=)
+                 (consp rhs) (eq (first rhs) :call)
+                 (or (str-call-p rhs) (kstr-call-p rhs))
+                 (assoc (second lhs) *str-vars* :test #'string-equal))
+            (let* ((entry  (assoc (second lhs) *str-vars*
+                                  :test #'string-equal))
+                   (size   (cdr entry))
+                   (args   (getf (cdr rhs) :args))
+                   (src    (lower-expr (first args)))
+                   (helper (if (str-call-p rhs)
+                               (intern "PROBE-READ-USER-STR" :whistler)
+                               (intern "PROBE-READ-KERNEL-STR" :whistler))))
+              `(,helper ,sym ,size ,src)))
            (t
             (ecase op
               (:=  `(setf ,sym ,(lower-expr rhs)))
@@ -2176,6 +2515,13 @@
            ;; (family + address). See gen-ntop-set for the layout.
            ((and (string= fn "ntop") (minfo-value-ntop-p info))
             (gen-ntop-set info keys (getf (cdr rhs) :args)))
+           ;; `@m[k] = str(ptr[, len])' / `kstr(...)' — probe-read
+           ;; a NUL-terminated string into the map's string slot.
+           ((and (or (string= fn "str") (string= fn "kstr"))
+                 (minfo-value-string-p info))
+            (gen-str-set info keys
+                         (first (getf (cdr rhs) :args))
+                         (string= fn "str")))
            (t (gen-scalar-set mname keys (lower-expr rhs) op)))))
       ;; `@m[k] = "literal"' or `= func' (already rewritten to :str).
       ;; The value slot is value-size bytes wide; lay out the literal
@@ -2199,6 +2545,31 @@
             (minfo-value-ntop-p info))
        (gen-ntop-set info keys (getf (cdr rhs) :args)))
       (t (gen-scalar-set mname keys (lower-expr rhs) op)))))
+
+(defun gen-str-set (info keys ptr-expr user-p)
+  "Store the NUL-terminated string at PTR-EXPR as @MNAME[KEYS]'s
+   value. Allocates a value-size scratch buffer, probe-reads into
+   it (user or kernel variant by USER-P), then map_update_elem."
+  (let* ((mname  (minfo-name info))
+         (vsize  (minfo-value-size info))
+         (buf    (gensym "VBUF"))
+         (tmpk   (gensym "K"))
+         (ptr-p  (keys-need-ptr-ops-p keys))
+         (helper (if user-p
+                     (intern "PROBE-READ-USER-STR" :whistler)
+                     (intern "PROBE-READ-KERNEL-STR" :whistler))))
+    (with-key keys
+      (lambda (k)
+        (let ((src (lower-expr ptr-expr)))
+          (if ptr-p
+              `(let ((,buf (whistler::struct-alloc ,vsize)))
+                 (,helper ,buf ,vsize ,src)
+                 (whistler::map-update-ptr ,mname ,k ,buf 0))
+              `(let* ((,tmpk whistler::u64 ,k)
+                      (,buf (whistler::struct-alloc ,vsize)))
+                 (,helper ,buf ,vsize ,src)
+                 (whistler::map-update-ptr
+                  ,mname (whistler::stack-addr ,tmpk) ,buf 0))))))))
 
 (defun gen-ntop-set (info keys ntop-args)
   "Store an ntop(…) result as @MNAME[KEYS]'s value: reuse the same
@@ -2613,32 +2984,48 @@
                                         (getf (cdr s) :rhs)))
                  (:if     (mapc #'walk (getf (cdr s) :then))
                           (mapc #'walk (getf (cdr s) :else)))
-                 (:while  (mapc #'walk (getf (cdr s) :body))))))
+                 (:while  (mapc #'walk (getf (cdr s) :body)))
+                 (:for    (mapc #'walk (getf (cdr s) :body))))))
       (mapc #'walk stmts))
     acc))
 
 (defun expand-tuple-vars-script (script)
-  "Apply expand-tuple-vars per probe (each has its own *tuple-vars*).
-   Returns a new script with all `\$v = (e1, e2, …)' uses inlined
-   to composite-key form."
-  (cons (first script)
-        (mapcar
-         (lambda (form)
-           (cond
-             ((and (consp form) (eq (first form) :probe))
-              (let* ((body (getf (cdr form) :body))
-                     (pred (getf (cdr form) :predicate))
-                     (*tuple-vars* (infer-tuple-vars body))
-                     (body* (expand-tuple-vars body))
-                     (pred* (when pred (expand-tuple-vars pred))))
-                (loop for (k v) on (cdr form) by #'cddr
-                      append (list k (cond ((eq k :body) body*)
-                                           ((eq k :predicate) pred*)
-                                           (t v)))
-                        into rest
-                      finally (return (cons :probe rest)))))
-             (t form)))
-         (rest script))))
+  "Apply expand-tuple-vars per top-form (probes AND user macros/fns).
+   Each form has its own *tuple-vars* derived from its body. Macros
+   need the same expansion since they're inlined at lower time;
+   without it, a `let \$key = (…)' inside a macro and the matching
+   `@m[\$key]' a few lines down would never collapse to composite-key
+   form."
+  (flet ((expand-body-form (form body-key drop-assigns)
+           (let* ((body (getf (cdr form) body-key))
+                  (pred (getf (cdr form) :predicate))
+                  (*tuple-vars* (infer-tuple-vars body))
+                  (body* (expand-tuple-vars body))
+                  (body* (if drop-assigns
+                             (drop-tuple-assignments body*)
+                             body*))
+                  (pred* (when pred (expand-tuple-vars pred))))
+             (loop for (k v) on (cdr form) by #'cddr
+                   append (list k (cond ((eq k body-key) body*)
+                                        ((eq k :predicate) pred*)
+                                        (t v)))
+                     into rest
+                   finally (return (cons (first form) rest))))))
+    (cons (first script)
+          (mapcar
+           (lambda (form)
+             (cond
+               ((and (consp form) (eq (first form) :probe))
+                (expand-body-form form :body nil))
+               ((and (consp form)
+                     (member (first form) '(:macro :function)))
+                ;; Drop tuple-assigns from macros now — there's no
+                ;; gen-kernel-prog pass for them, so without it the
+                ;; assignment survives into the inlined body and
+                ;; trips lower-assign on `\$v = (:tuple …)'.
+                (expand-body-form form :body t))
+               (t form)))
+           (rest script)))))
 
 (defun drop-tuple-assignments (stmts)
   "Drop \`\$v = (:tuple …)' statements from a body — the var is
@@ -2658,6 +3045,12 @@
        ((eq (first s) :while)
         (list :while
               :cond (getf (cdr s) :cond)
+              :body (drop-tuple-assignments (getf (cdr s) :body))))
+       ((eq (first s) :for)
+        (list :for
+              :var (getf (cdr s) :var)
+              :start (getf (cdr s) :start)
+              :end (getf (cdr s) :end)
               :body (drop-tuple-assignments (getf (cdr s) :body))))
        (t s)))
    stmts))
@@ -2702,6 +3095,64 @@
                (t (cons (walk (first f)) (walk (rest f)))))))
     (walk form)))
 
+(defun walk-stmts-with-macros (stmts walk-fn)
+  "Apply WALK-FN to every statement in STMTS and to every statement
+   in every user-fn/macro body transitively reachable via :call.
+   Used by the per-probe inference passes so $vars defined inside a
+   macro (e.g. opensnoop's `$path = str(@filename[tid])' in
+   sys_exit) are seen at probe scope before lowering. Each macro
+   is visited at most once per top-level call to avoid infinite
+   recursion on mutually-recursive definitions."
+  (let ((visited (make-hash-table :test 'equal)))
+    (labels ((scan-call (form)
+               (when (and (consp form) (eq (first form) :call))
+                 (let ((name (getf (cdr form) :name)))
+                   (when (and name (not (gethash name visited)))
+                     (let ((fn (find-user-function name)))
+                       (when fn
+                         (setf (gethash name visited) t)
+                         (mapc #'walk-and-recurse (getf fn :body))))))))
+             (scan-expr (e)
+               (when (consp e)
+                 (scan-call e)
+                 (mapc (lambda (x) (when (consp x) (scan-expr x))) (rest e))))
+             (walk-and-recurse (s)
+               (funcall walk-fn s)
+               (case (first s)
+                 (:if (mapc #'walk-and-recurse (getf (cdr s) :then))
+                      (mapc #'walk-and-recurse (getf (cdr s) :else)))
+                 (:while (mapc #'walk-and-recurse (getf (cdr s) :body)))
+                 (:for   (mapc #'walk-and-recurse (getf (cdr s) :body))))
+               ;; Sniff expressions for embedded user-fn calls so a
+               ;; bare `(:expr (:call name args))' or an assignment
+               ;; whose RHS calls a user fn pulls in that body too.
+               (case (first s)
+                 (:expr   (scan-expr (second s)))
+                 (:assign (scan-expr (getf (cdr s) :rhs))))))
+      (mapc #'walk-and-recurse stmts))))
+
+(defun infer-str-vars (stmts)
+  "Return an alist (VAR-NAME . SIZE) of $vars assigned from a
+   `str(…)' / `kstr(…)' call. SIZE is the explicit second arg if
+   present, otherwise +bt-str-default-len+. Scans into user-fn /
+   macro bodies via walk-stmts-with-macros so $vars defined inside
+   a called macro get sized at probe scope before lowering."
+  (let ((acc nil))
+    (flet ((maybe-record (s)
+             (when (eq (first s) :assign)
+               (let* ((lhs (getf (cdr s) :lhs))
+                      (rhs (getf (cdr s) :rhs))
+                      (sz  (when (and (consp rhs) (eq (first rhs) :call)
+                                      (or (str-call-p rhs) (kstr-call-p rhs)))
+                             (str-key-size rhs))))
+                 (when (and sz (consp lhs) (eq (first lhs) :var))
+                   (let ((entry (assoc (second lhs) acc :test #'string=)))
+                     (if entry
+                         (setf (cdr entry) (max (cdr entry) sz))
+                         (push (cons (second lhs) sz) acc))))))))
+      (walk-stmts-with-macros stmts #'maybe-record))
+    acc))
+
 (defun infer-comm-vars (stmts)
   "Return a list of var-name strings whose value comes from `comm'
    or from a string-valued map. Walks if/while bodies."
@@ -2723,7 +3174,8 @@
                                         (getf (cdr s) :rhs)))
                  (:if     (mapc #'walk (getf (cdr s) :then))
                           (mapc #'walk (getf (cdr s) :else)))
-                 (:while  (mapc #'walk (getf (cdr s) :body))))))
+                 (:while  (mapc #'walk (getf (cdr s) :body)))
+                 (:for    (mapc #'walk (getf (cdr s) :body))))))
       (mapc #'walk stmts))
     acc))
 
@@ -2753,30 +3205,103 @@
                                         (getf (cdr s) :rhs)))
                  (:if     (mapc #'walk (getf (cdr s) :then))
                           (mapc #'walk (getf (cdr s) :else)))
-                 (:while  (mapc #'walk (getf (cdr s) :body))))))
+                 (:while  (mapc #'walk (getf (cdr s) :body)))
+                 (:for    (mapc #'walk (getf (cdr s) :body))))))
       (mapc #'walk stmts))
     acc))
 
+(defun field-chain-leaf-struct (rhs known-types)
+  "If RHS is a (possibly chained) :field expression whose root is
+   :curtask or a :var with a known struct type, walk the chain
+   through vmlinux BTF and return the struct name of the leaf
+   field's pointer target — e.g. `curtask.fs.pwd.mnt' → \"vfsmount\".
+   Returns NIL for any chain we can't fully resolve, the leaf isn't
+   a pointer-to-struct, or vmlinux BTF is unavailable. KNOWN-TYPES
+   is the accumulator from infer-var-types so far."
+  (unless (and (consp rhs) (eq (first rhs) :field)) (return-from field-chain-leaf-struct nil))
+  (let ((names nil) (root nil))
+    (labels ((walk (e)
+               (cond
+                 ((and (consp e) (eq (first e) :field))
+                  (push (getf (cdr e) :name) names)
+                  (walk (getf (cdr e) :base)))
+                 (t (setf root e)))))
+      (walk rhs))
+    (let ((root-struct
+            (cond
+              ((and (consp root) (eq (first root) :curtask)) "task_struct")
+              ((and (consp root) (eq (first root) :var))
+               (cdr (assoc (second root) known-types :test #'string=))))))
+      (unless root-struct (return-from field-chain-leaf-struct nil))
+      (let* ((vmbtf (ignore-errors (whistler:ensure-vmlinux-btf)))
+             (current-tid (and vmbtf
+                               (whistler:btf-find-struct vmbtf root-struct))))
+        (unless current-tid (return-from field-chain-leaf-struct nil))
+        (loop for (fname . rest) on names
+              for is-leaf = (null rest)
+              do (let* ((fields (whistler:btf-struct-fields vmbtf current-tid))
+                        (cell   (find fname fields :test #'string= :key #'first)))
+                   (unless cell (return-from field-chain-leaf-struct nil))
+                   (let ((bpf-type (second cell))
+                         (size     (fourth cell))
+                         (sub-name (fifth cell))
+                         (sub-tid  (sixth cell)))
+                     (cond
+                       (is-leaf
+                        (when (and (eql size 8) (stringp sub-name)
+                                   (string= sub-name "ptr"))
+                          (let ((target (whistler:btf-ptr-target-type-id
+                                         vmbtf sub-tid)))
+                            (return-from field-chain-leaf-struct
+                              (and target (whistler:btf-type-name vmbtf target))))))
+                       ;; Embedded struct/union — keep walking.
+                       ((and (null bpf-type) sub-name
+                             (not (and (stringp sub-name)
+                                       (string= sub-name "ptr"))))
+                        (setf current-tid
+                              (or (whistler:btf-member-raw-type-id
+                                   vmbtf sub-tid)
+                                  sub-tid)))
+                       ;; Mid-chain pointer — follow to its target.
+                       ((and (eql size 8) (stringp sub-name)
+                             (string= sub-name "ptr"))
+                        (let ((target (whistler:btf-ptr-target-type-id
+                                       vmbtf sub-tid)))
+                          (unless target
+                            (return-from field-chain-leaf-struct nil))
+                          (setf current-tid target)))
+                       (t (return-from field-chain-leaf-struct nil)))))
+              finally (return nil))))))
+
 (defun infer-var-types (stmts)
-  "Walk STMTS for `$v = (struct X *)EXPR' (or any RHS that contains
-   a cast at its outermost reachable position) and return an alist
-   (\"v\" . \"X\"). Also propagates types through map reads:
-   `$v = @m[k]' picks up @m's value-struct (set when the map was
-   first assigned a cast RHS), letting `$v.field' walks work
-   transparently across an in-kernel `stash + retrieve' hop."
+  "Walk STMTS and return an alist (VAR-NAME . STRUCT-NAME) recording
+   the struct type of each `$v' that was assigned from:
+     * `(struct X *)EXPR'                — explicit cast
+     * `@m[k]'                            — typed map read
+     * `curtask.…' or `$typed.…'         — BTF-resolved field chain
+                                           whose leaf is a pointer
+     * `$other'                           — another already-typed var
+   The chain case is what makes `$dentry = curtask.fs.pwd.dentry; …
+   $dentry.d_parent' walk correctly across the `$v = chain; $v.field'
+   stash pattern bpftrace scripts lean on."
   (let ((acc nil))
     (labels ((rhs-cast-type (rhs)
                (cond
                  ((not (consp rhs)) nil)
                  ((eq (first rhs) :cast) (getf (cdr rhs) :type))
                  ((eq (first rhs) :field)
-                  (rhs-cast-type (getf (cdr rhs) :base)))
-                 ;; `$v = @m[k]' — inherit the map's value-struct.
+                  (or (field-chain-leaf-struct rhs acc)
+                      ;; Fallback: if the chain wraps an inner cast we
+                      ;; should still see that as the type — preserves
+                      ;; the old behaviour for `((struct X *)e).f'.
+                      (rhs-cast-type (getf (cdr rhs) :base))))
                  ((eq (first rhs) :map)
                   (let ((info (and *map-table*
                                    (gethash (getf (cdr rhs) :name)
                                             *map-table*))))
                     (and info (minfo-value-struct info))))
+                 ((eq (first rhs) :var)
+                  (cdr (assoc (second rhs) acc :test #'string=)))
                  (t nil)))
              (maybe-record (lhs rhs)
                (when (and (consp lhs) (eq (first lhs) :var))
@@ -2789,7 +3314,8 @@
                                         (getf (cdr s) :rhs)))
                  (:if     (mapc #'walk (getf (cdr s) :then))
                           (mapc #'walk (getf (cdr s) :else)))
-                 (:while  (mapc #'walk (getf (cdr s) :body))))))
+                 (:while  (mapc #'walk (getf (cdr s) :body)))
+                 (:for    (mapc #'walk (getf (cdr s) :body))))))
       (mapc #'walk stmts))
     acc))
 
@@ -2814,7 +3340,8 @@
                                       (getf (cdr s) :rhs)))
                  (:if     (mapc #'walk (getf (cdr s) :then))
                           (mapc #'walk (getf (cdr s) :else)))
-                 (:while  (mapc #'walk (getf (cdr s) :body))))))
+                 (:while  (mapc #'walk (getf (cdr s) :body)))
+                 (:for    (mapc #'walk (getf (cdr s) :body))))))
       (mapc #'walk body))
     m))
 
@@ -2824,6 +3351,7 @@
            (*var-types*  (infer-var-types body))
            (*ntop-vars*  (infer-ntop-vars body))
            (*comm-vars*  (infer-comm-vars body))
+           (*str-vars*   (infer-str-vars body))
            (*tuple-vars* (infer-tuple-vars body))
            (probe-str (format nil "~A" section))
            (func-str  (probe-func-name spec))
@@ -2838,6 +3366,8 @@
            (*string-set-buf-size* (probe-string-buf-size body))
            (*string-set-buf*
              (when (plusp *string-set-buf-size*) (gensym "STRBUF")))
+           (*scratch-allocations* nil)
+           (*scratch-base-sym* (gensym "BT-SCRATCH-BASE"))
            (prog-name (intern (format nil "BT-PROBE-~D-~D" index sub) :whistler))
            (vars      (collect-vars body))
            (body-forms (lower-stmts body))
@@ -2860,11 +3390,16 @@
                    for is-comm = (and as-bt
                                       (member as-bt *comm-vars*
                                               :test #'string-equal))
+                   for str-size = (and as-bt
+                                       (cdr (assoc as-bt *str-vars*
+                                                   :test #'string-equal)))
                    collect (cond
                              (is-ntop `(,v (whistler::struct-alloc
                                             ,+bt-ntop-slot-size+)))
                              (is-comm `(,v (whistler::struct-alloc
                                             ,+bt-comm-len+)))
+                             (str-size `(,v (whistler::struct-alloc
+                                             ,str-size)))
                              (t `(,v 0)))))
            ;; Prepend the shared string buffer to the bindings if used.
            (var-inits (if *string-set-buf*
@@ -2873,12 +3408,36 @@
                                    ,*string-set-buf-size*))
                                 var-inits)
                           var-inits))
-           (with-vars (if var-inits
-                          `((let* ,var-inits ,@gated 0))
-                          (append gated '(0)))))
-      `(whistler:defprog ,prog-name
-           (:type ,ptype :section ,section :license "GPL")
-         ,@with-vars))))
+           ;; Spill large struct-allocs to the per-CPU scratch map.
+           ;; rewrite traverses everything we've already lowered (body
+           ;; AND var-inits), pulling alloc sites into
+           ;; *scratch-allocations*; we then assign each a fixed
+           ;; offset within the per-CPU buffer and wrap the body in
+           ;; a let* that pins the map-lookup result. The whole
+           ;; gated body is wrapped in a single when-let so a NULL
+           ;; lookup (verifier wants us to handle it; per-CPU array
+           ;; key=0 can't actually fail) short-circuits cleanly.
+           (var-inits  (rewrite-large-struct-allocs var-inits))
+           (gated      (rewrite-large-struct-allocs gated)))
+      (multiple-value-bind (offsets total)
+          (assign-scratch-offsets *scratch-allocations*)
+        (setf var-inits (substitute-scratch-offsets var-inits offsets))
+        (setf gated     (substitute-scratch-offsets gated     offsets))
+        (when (plusp total)
+          (setf *max-scratch-bytes* (max *max-scratch-bytes* total)))
+        (let* ((with-vars (if var-inits
+                              `((let* ,var-inits ,@gated 0))
+                              (append gated '(0))))
+               (with-scratch
+                 (cond
+                   ((zerop total) with-vars)
+                   (t `((whistler:when-let
+                            ((,*scratch-base-sym*
+                              (whistler::map-lookup ,*bt-scratch-map-name* 0)))
+                          ,@with-vars))))))
+          `(whistler:defprog ,prog-name
+               (:type ,ptype :section ,section :license "GPL")
+             ,@with-scratch))))))
 
 (defun collect-tracepoint-fields (script)
   "Walk SCRIPT and return ((CAT EVENT) . (FIELD …)) entries —
@@ -3019,13 +3578,16 @@
          (*time-format-table* nil)
          (*cat-paths-table* nil)
          (*map-id-table* nil)
+         (*max-scratch-bytes* 0)
+         ;; Expand tuple-var references BEFORE infer-maps so the map's
+         ;; key-size lands at the composite total, not at 8 (the size
+         ;; of the var alias). expand-tuple-vars-script rewrites
+         ;; macro bodies too, so *user-functions* below picks up the
+         ;; tuple-expanded versions.
+         (script    (expand-tuple-vars-script script))
          (*user-functions* (loop for fn in (script-functions script)
                                  collect (cons (getf (cdr fn) :name)
                                                (cdr fn))))
-         ;; Expand tuple-var references BEFORE infer-maps so the map's
-         ;; key-size lands at the composite total, not at 8 (the size
-         ;; of the var alias).
-         (script    (expand-tuple-vars-script script))
          (map-table (infer-maps script))
          (*map-table* map-table)
          (maps      (loop for info being the hash-values of map-table
@@ -3061,10 +3623,22 @@
           do (multiple-value-bind (kforms us) (gen-probe-forms probe i)
                (setf probes (append probes kforms)
                      user   (append user us))))
+    ;; Per-CPU scratch map (auto-defined when any probe spilled a
+    ;; struct-alloc above +bt-scratch-threshold+ to it). Sized to
+    ;; the largest per-probe footprint — probes that need less just
+    ;; use a prefix of the buffer.
+    (let ((scratch-map-form
+            (when (plusp *max-scratch-bytes*)
+              `(whistler:defmap ,*bt-scratch-map-name*
+                 :type :percpu-array
+                 :key-size 4
+                 :value-size ,*max-scratch-bytes*
+                 :max-entries 1))))
     (list :maps (append (when exit-map-form    (list exit-map-form))
                         (when print-map-form   (list print-map-form))
                         (when stacks-map-form  (list stacks-map-form))
                         (when elapsed-map-form (list elapsed-map-form))
+                        (when scratch-map-form (list scratch-map-form))
                         maps)
           :progs (append tp-preamble probes)
           :user-probes user
@@ -3091,4 +3665,4 @@
                                     :keyed-p (minfo-keyed-p info)
                                     :value-size (minfo-value-size info)
                                     :max-entries (minfo-max-entries info)
-                                    :hist-params (minfo-hist-params info))))))
+                                    :hist-params (minfo-hist-params info)))))))

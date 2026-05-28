@@ -406,6 +406,40 @@
      (let* ((folded (mapcar #'constant-fold-sexpr form))
             (head (car folded))
             (args (cdr folded)))
+       ;; Fold IF / WHEN / UNLESS when the test is a literal integer.
+       ;; bpftrace tools produce these via macros that call
+       ;; getopt(name, literal-default, …) — without folding here,
+       ;; the dead branch survives into the SSA optimizer where
+       ;; simplify-cfg's block-merge pass can leave dangling
+       ;; branch targets and crash the emitter.
+       (when (and (symbolp head)
+                  (consp args)
+                  (integerp (first args))
+                  (member (symbol-name head) '("IF" "WHEN" "UNLESS")
+                          :test #'string=))
+         (let* ((name (symbol-name head))
+                (test (first args))
+                (true-p (not (zerop test))))
+           (return-from constant-fold-sexpr
+             (cond
+               ((string= name "IF")
+                (cond (true-p (second args))
+                      ((third args) (third args))
+                      (t 0)))
+               ((string= name "WHEN")
+                (cond (true-p
+                       (case (length (rest args))
+                         (0 0)
+                         (1 (second args))
+                         (t `(progn ,@(rest args)))))
+                      (t 0)))
+               ((string= name "UNLESS")
+                (cond ((not true-p)
+                       (case (length (rest args))
+                         (0 0)
+                         (1 (second args))
+                         (t `(progn ,@(rest args)))))
+                      (t 0)))))))
        ;; Try to fold if head is an arithmetic op and all args are integers
        (if (and (symbolp head)
                 args
@@ -429,5 +463,21 @@
                 (logand (first args) (second args)))
                ((and (string= name "|") (= (length args) 2))
                 (logior (first args) (second args)))
+               ;; Comparisons fold to 1/0 — keeps the simplify-cfg pass
+               ;; from blowing up on dead-branch patterns like
+               ;; `(when (= 0 0) …)' that bpftrace tools generate via
+               ;; getopt() of a literal flag.
+               ((and (string= name "=")  (= (length args) 2))
+                (if (= (first args) (second args)) 1 0))
+               ((and (string= name "/=") (= (length args) 2))
+                (if (/= (first args) (second args)) 1 0))
+               ((and (string= name "<")  (= (length args) 2))
+                (if (< (first args) (second args)) 1 0))
+               ((and (string= name "<=") (= (length args) 2))
+                (if (<= (first args) (second args)) 1 0))
+               ((and (string= name ">")  (= (length args) 2))
+                (if (> (first args) (second args)) 1 0))
+               ((and (string= name ">=") (= (length args) 2))
+                (if (>= (first args) (second args)) 1 0))
                (t folded)))
            folded)))))

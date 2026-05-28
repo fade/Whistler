@@ -914,6 +914,19 @@
       (t
        (concatenate 'string (make-string (- width len) :initial-element pad-char) text)))))
 
+(sb-alien:define-alien-routine ("strerror" %strerror) sb-alien:c-string
+  (errnum sb-alien:int))
+
+(defun errno-string (errno)
+  "Return the system strerror(3) message for ERRNO. Reads the libc
+   thread-local buffer. Negative values are normalised — bpftrace
+   tools typically store `-ret' as the errno value but sometimes
+   leave it as the raw negative kernel return."
+  (let ((n (cond ((zerop errno) 0)
+                 ((>= errno 0) errno)
+                 (t (- errno)))))
+    (or (%strerror n) (format nil "errno ~D" n))))
+
 (defun format-printf (fmt args)
   "C-style printf. ARGS is a list whose entries match the printf-table's
    per-arg type list: ints come through as integers, strings come
@@ -1032,6 +1045,11 @@
                                              (b3 (sb-sys:sap-ref-8 sap (+ off 3))))
                                          (incf off 4)
                                          (format nil "~D.~D.~D.~D" b0 b1 b2 b3)))
+                                      ((eq ty :strerror)
+                                       ;; u32 errno → libc strerror(3) message.
+                                       (let ((errno (sap-read-u32-le sap off)))
+                                         (incf off 4)
+                                         (errno-string errno)))
                                       ((eq ty :ipv6)
                                        (prog1 (format-ipv6 sap off)
                                          (incf off 16)))
