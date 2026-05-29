@@ -529,6 +529,15 @@
       (:offsetof-expr
        (let* ((idents (mapcar #'text-of (all-tagged inner :ident))))
          (list :offsetof :struct (first idents) :field (second idents))))
+      (:sizeof-expr
+       ;; Grammar wraps the inner alternative as either :sizeof-struct
+       ;; (with the `struct' keyword consumed) or :sizeof-type. The
+       ;; ident lives one level deeper either way.
+       (let* ((sub  (or (first-tagged inner :sizeof-struct)
+                        (first-tagged inner :sizeof-type)))
+              (ident (and sub (text-of (first-tagged sub :ident)))))
+         (list :sizeof :name ident
+               :struct-p (and sub (eq (tag-of sub) :sizeof-struct)))))
       (:hex-int      (list :int (parse-integer (text-of inner) :start 2 :radix 16)))
       (:integer      (list :int (parse-integer-with-exp (text-of inner))))
       (t (error "unexpected primary: ~S" inner)))))

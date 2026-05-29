@@ -155,7 +155,7 @@
            #:deftracepoint #:import-kernel-struct
            #:reset-vmlinux-btf-cache
            #:btf-find-func #:btf-func-params #:btf-enum-values
-           #:btf-find-struct #:btf-struct-fields #:btf-resolve-array
+           #:btf-find-struct #:btf-struct-fields #:btf-struct-size #:btf-resolve-array
            #:btf-ptr-target-type-id #:btf-type-name
            #:btf-member-raw-type-id #:ensure-vmlinux-btf
            ;; Memory operations

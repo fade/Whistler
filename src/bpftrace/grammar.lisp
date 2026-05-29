@@ -282,11 +282,19 @@
   arrow-access   = <'->'> ident
   index-access   = <'['> <ws> expr (<ws> <','> <ws> expr)* <ws> <']'>
 
-  primary        = cast / primitive-cast / offsetof-expr / tuple / parens / func-call / map-access / scalar-var / builtin /
+  primary        = cast / primitive-cast / offsetof-expr / sizeof-expr / tuple / parens / func-call / map-access / scalar-var / builtin /
                    constant / string-lit / hex-int / integer
   (* offsetof(struct NAME, FIELD) — resolved to an integer constant
      at compile time via BTF. *)
   offsetof-expr  = <'offsetof'> <ws> <'('> <ws> <'struct'> <ws> ident <ws> <','> <ws> ident <ws> <')'>
+  (* sizeof(struct NAME) or sizeof(TYPE) — compile-time byte size.
+     We accept a struct form (BTF lookup), or a primitive-type ident
+     resolved via the curated table. The `sizeof-struct' /
+     `sizeof-type' alternatives let the AST normalizer dispatch on
+     which one matched. *)
+  sizeof-expr    = <'sizeof'> <ws> <'('> <ws> (sizeof-struct / sizeof-type) <ws> <')'>
+  sizeof-struct  = <'struct'> <ws> ident
+  sizeof-type    = ident
   (* `(e1, e2, …)' — bpftrace tuple literal. Always 2+ elements so
      it doesn't conflict with the parenthesised single expression
      form. Components must be simple (pure) — biosnoop uses them as

@@ -681,6 +681,27 @@
          (unsupported "offsetof(struct ~A, ~A): no such field"
                       struct-name field-name))
        (third cell)))
+    (:sizeof
+     (let* ((name      (getf (cdr expr) :name))
+            (struct-p  (getf (cdr expr) :struct-p)))
+       (cond
+         (struct-p
+          (let* ((vmbtf (whistler:ensure-vmlinux-btf))
+                 (tid (whistler:btf-find-struct vmbtf name)))
+            (unless tid
+              (unsupported "sizeof(struct ~A): not in vmlinux BTF" name))
+            (whistler:btf-struct-size vmbtf tid)))
+         (t
+          (or (cdr (assoc (string-downcase name)
+                          '(("u8"  . 1) ("u16" . 2) ("u32" . 4) ("u64" . 8)
+                            ("int8" . 1) ("int16" . 2) ("int32" . 4)
+                            ("int64" . 8)
+                            ("int"   . 4) ("uint"   . 4)
+                            ("long"  . 8) ("ulong"  . 8)
+                            ("char"  . 1) ("uchar"  . 1)
+                            ("short" . 2) ("ushort" . 2))
+                          :test #'string=))
+              (unsupported "sizeof(~A): unrecognised primitive type" name))))))
     (:var        (var-sym (second expr)))
     (:builtin
      ;; bpftrace allows a zero-arg `macro' to be referenced bare —
@@ -1247,6 +1268,47 @@
                                        ,co-off)))
            (whistler::probe-read-kernel ,dst-ptr ,size ,src-ptr))))))
 
+(defun lower-current-task-int-field (field-name size-bytes load-type)
+  "probe-read a scalar field SIZE-BYTES wide off current_task,
+   returning the LOAD-TYPE value. Used for leader_tid (which is just
+   the current task's `tgid')."
+  (let* ((vmbtf (whistler:ensure-vmlinux-btf))
+         (task-id (whistler:btf-find-struct vmbtf "task_struct"))
+         (fields (and task-id (whistler:btf-struct-fields vmbtf task-id)))
+         (cell (find field-name fields :test #'string= :key #'first))
+         (off (and cell (third cell)))
+         (buf (gensym "TBUF")))
+    (unless off
+      (unsupported "leader_tid: vmlinux BTF missing task_struct.~A" field-name))
+    `(let ((,buf (whistler::struct-alloc ,size-bytes)))
+       (whistler::probe-read-kernel
+        ,buf ,size-bytes
+        (whistler::+ (whistler::get-current-task) ,off))
+       (whistler::load ,(intern (symbol-name load-type) :whistler) ,buf 0))))
+
+(defun lower-leader-comm ()
+  "Walk current_task→group_leader and copy its TASK_COMM_LEN-byte
+   comm[] into a fresh stack buffer; return that buffer pointer."
+  (let* ((vmbtf (whistler:ensure-vmlinux-btf))
+         (task-id (whistler:btf-find-struct vmbtf "task_struct"))
+         (fields (and task-id (whistler:btf-struct-fields vmbtf task-id)))
+         (gl (find "group_leader" fields :test #'string= :key #'first))
+         (co (find "comm"         fields :test #'string= :key #'first))
+         (gl-off (and gl (third gl)))
+         (co-off (and co (third co)))
+         (leader (gensym "LEADER"))
+         (buf    (gensym "LCOMM")))
+    (unless (and gl-off co-off)
+      (unsupported "leader_comm: vmlinux BTF missing task_struct.group_leader/comm"))
+    `(let* ((,leader (whistler::struct-alloc 8))
+            (,buf    (whistler::struct-alloc ,+bt-comm-len+)))
+       (whistler::probe-read-kernel
+        ,leader 8 (whistler::+ (whistler::get-current-task) ,gl-off))
+       (whistler::probe-read-kernel
+        ,buf ,+bt-comm-len+
+        (whistler::+ (whistler::load whistler::u64 ,leader 0) ,co-off))
+       ,buf)))
+
 (defun lower-ppid-builtin ()
   "Parent PID — walk `current_task->real_parent->tgid'. real_parent
    is a `struct task_struct *' so we probe-read the pointer field
@@ -1526,6 +1588,8 @@
       ((string= name "delete") 0)           ; lower-expr-stmt handles the real call
       ((string= name "reg")    (lower-reg-call (getf (cdr expr) :args)))
       ((string= name "kaddr")  (lower-kaddr-call (getf (cdr expr) :args)))
+      ((string= name "percpu_kaddr")
+       (lower-percpu-kaddr-call (getf (cdr expr) :args)))
       ((string= name "has_key") (lower-has-key-call (getf (cdr expr) :args)))
       ;; `bswap(x)' — byte-swap. bpftrace's bswap on a u16/u32 reverses
       ;; the byte order. We pick the width from key context; for the
@@ -1627,6 +1691,15 @@
        (or *child-cpid* 0))
       ((and (string= name "has_cpid") (null (getf (cdr expr) :args)))
        (if *child-cpid* 1 0))
+      ;; leader_tid() — TID of the thread-group leader. Same as the
+      ;; current task's `tgid' field for the no-arg form.
+      ((and (string= name "leader_tid") (null (getf (cdr expr) :args)))
+       (lower-current-task-int-field "tgid" 4 'u32))
+      ;; leader_comm() — emit a comm-style buffer holding the group
+      ;; leader's TASK_COMM_LEN bytes. Walks
+      ;; `current_task->group_leader->comm'.
+      ((and (string= name "leader_comm") (null (getf (cdr expr) :args)))
+       (lower-leader-comm))
       ;; Compile-time type predicates from bpftrace's meta.bt. Each
       ;; folds to a 0/1 integer literal based on the argument's AST
       ;; shape, so generic macros can dispatch with `if comptime'.
@@ -1841,6 +1914,27 @@
                     (need CAP_SYS_ADMIN to see non-zero addresses)"
                    name))
     addr))
+
+(defun lower-percpu-kaddr-call (args)
+  "Lower percpu_kaddr(\"name\") or percpu_kaddr(\"name\", cpu) — looks
+   up the per-CPU symbol in /proc/kallsyms then calls
+   bpf_per_cpu_ptr(ptr, cpu) to materialise the per-CPU instance's
+   address. With no CPU arg, defaults to the current CPU."
+  (unless (and args (consp (first args))
+               (eq (first (first args)) :str)
+               (or (= 1 (length args)) (= 2 (length args))))
+    (unsupported "percpu_kaddr() takes (\"name\" [, cpu])"))
+  (unless *kallsyms-addr-cache*
+    (setf *kallsyms-addr-cache* (load-kallsyms-addrs)))
+  (let* ((name (second (first args)))
+         (addr (gethash name *kallsyms-addr-cache*))
+         (cpu  (if (cdr args)
+                   (lower-expr (second args))
+                   '(whistler::get-smp-processor-id))))
+    (unless addr
+      (unsupported "percpu_kaddr(~S) — symbol not found in /proc/kallsyms"
+                   name))
+    `(whistler::per-cpu-ptr ,addr ,cpu)))
 
 (defun lower-has-key-call (args)
   "Lower `has_key(@map, key…)' to 1 if `bpf_map_lookup_elem' returns

@@ -244,6 +244,15 @@
                   (return (values nil (getf rec :size) name))))
                (t (return (values 'u64 8 "unknown")))))))
 
+(defun btf-struct-size (vmbtf struct-type-id)
+  "Return the byte size of the struct (or union) with the given BTF
+   type id, or NIL when the id doesn't name a struct/union."
+  (let* ((types (vmlinux-btf-types vmbtf))
+         (rec   (aref types struct-type-id))
+         (kind  (getf rec :kind)))
+    (when (or (= kind +btf-kind-struct+) (= kind +btf-kind-union+))
+      (getf rec :size))))
+
 (defun btf-struct-fields (vmbtf struct-type-id)
   "Extract fields from a BTF struct, recursively flattening anonymous
    struct/union members. Returns list of (name type offset size
