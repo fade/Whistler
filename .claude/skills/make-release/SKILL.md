@@ -112,11 +112,25 @@ XDG_CACHE_HOME=/tmp/.cache make test
 
 If any tests fail, stop and report the failure. Do NOT continue.
 
-## 5. Generate release notes
+## 5. Add a CHANGELOG entry
 
-Create `doc/release-notes/RELEASE-NOTES-VERSION.md`.
+Prepend a new section to `CHANGELOG.md` directly under the top-level
+heading. Format:
 
-To decide what goes in the notes, diff against the most recent tag:
+```
+## VERSION — YYYY-MM-DD
+
+### New Features
+
+...
+
+### Bug Fixes
+
+...
+```
+
+Use today's date. To decide what goes in the section, diff against the
+most recent tag:
 
 ```bash
 git log $(git describe --tags --abbrev=0)..HEAD --oneline
@@ -129,12 +143,12 @@ Include ONLY user-facing changes:
 
 Do NOT include internal changes (refactors, lint fixes, doc updates, CI changes, directory reorganization). Those are visible in the git log for anyone who needs them.
 
-Match the voice and format of previous release notes in `doc/release-notes/`.
+Match the voice and heading style of previous entries already in `CHANGELOG.md`.
 
 ## 6. Commit
 
 ```bash
-git add whistler.asd doc/release-notes/RELEASE-NOTES-VERSION.md
+git add whistler.asd CHANGELOG.md
 git commit -m "Bump version to VERSION"
 ```
 

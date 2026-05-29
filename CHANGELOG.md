@@ -1,7 +1,6 @@
 # Changelog
 
-All notable changes per release. Sourced from `doc/release-notes/RELEASE-NOTES-X.Y.Z.md`,
-which remain the authoritative per-release files.
+All notable user-facing changes per release. Newest first.
 
 ## 1.10.0 — 2026-05-28
 
