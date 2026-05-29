@@ -664,13 +664,23 @@
 (defun norm-unary (node)
   (let* ((kids (children-of node))
          (op-node (find-if (lambda (c) (and (consp c) (eq (tag-of c) :unary-op))) kids))
+         (prefix-node (find-if (lambda (c)
+                                 (and (consp c) (eq (tag-of c) :prefix-incdec)))
+                               kids))
          (arg-node (find-if (lambda (c)
-                              (and (consp c) (not (eq (tag-of c) :unary-op))))
+                              (and (consp c)
+                                   (not (member (tag-of c)
+                                                '(:unary-op :prefix-incdec)))))
                             kids)))
-    (if op-node
-        (list :un :op (op->kw (text-of op-node))
-              :arg (norm-expr-dispatch arg-node))
-        (norm-expr-dispatch arg-node))))
+    (cond
+      (prefix-node
+       (list :incdec-expr :lhs (norm-expr-dispatch arg-node)
+             :op (if (string= (text-of prefix-node) "++") :inc :dec)
+             :form :pre))
+      (op-node
+       (list :un :op (op->kw (text-of op-node))
+             :arg (norm-expr-dispatch arg-node)))
+      (t (norm-expr-dispatch arg-node)))))
 
 (defun norm-postfix (node)
   (let* ((kids (children-of node))
@@ -691,7 +701,11 @@
                                        :keys (mapcar #'norm-expr-dispatch
                                                      (remove-if-not
                                                       #'consp
-                                                      (children-of inner))))))))
+                                                      (children-of inner)))))
+                  (:postfix-incdec
+                   (list :incdec-expr :lhs acc :op
+                         (if (string= (text-of inner) "++") :inc :dec)
+                         :form :post)))))
             tails :initial-value base)))
 
 (defun norm-primary (node)
@@ -774,6 +788,15 @@
                :struct-p (and sub (eq (tag-of sub) :sizeof-struct)))))
       (:hex-int      (list :int (parse-integer (text-of inner) :start 2 :radix 16)))
       (:integer      (list :int (parse-integer-with-exp (text-of inner))))
+      (:duration-literal
+       ;; `100ms', `5us', `1s', `1ns' → integer nanoseconds.
+       (let* ((n (parse-integer-with-exp
+                  (text-of (first-tagged inner :integer))))
+              (unit (text-of (first-tagged inner :duration-unit))))
+         (list :int (* n (cond ((string= unit "ns")  1)
+                               ((string= unit "us")  1000)
+                               ((string= unit "ms")  1000000)
+                               ((string= unit "s")   1000000000))))))
       (t (error "unexpected primary: ~S" inner)))))
 
 (defun parse-integer-with-exp (s)

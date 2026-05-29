@@ -337,19 +337,31 @@
   shift          = add (<ws> ('<<' / '>>') <ws> add)*
   add            = mul (<ws> ('+' / '-') <ws> mul)*
   mul            = unary (<ws> ('*' / '/' / '%') <ws> unary)*
-  unary          = unary-op <ws> unary / postfix
+  unary          = unary-op <ws> unary / prefix-incdec <ws> postfix / postfix
   (* `*EXPR' is a u64 pointer dereference — common in tools that
      read kernel global symbols, e.g. *kaddr(\"avenrun\"). *)
   unary-op       = '!' / '-' / '~' / '*'
+  prefix-incdec  = '++' / '--'
 
   postfix        = primary postfix-tail*
-  postfix-tail   = field-access / arrow-access / index-access
+  (* postfix-tail covers `.field' / `->field' / `[idx]' / `++' / `--'.
+     The incdec forms are side-effecting; codegen wraps the underlying
+     map / var update in `prog1' / `progn' so the surrounding expr
+     sees the right value. *)
+  postfix-tail   = field-access / arrow-access / index-access / postfix-incdec
+  postfix-incdec = '++' / '--'
   field-access   = <'.'> ident
   arrow-access   = <'->'> ident
   index-access   = <'['> <ws> expr (<ws> <','> <ws> expr)* <ws> <']'>
 
   primary        = cast / primitive-pointer-cast / primitive-cast / block-expr / offsetof-expr / sizeof-expr / tuple / parens / func-call / map-access / scalar-var / builtin /
-                   constant / string-lit / hex-int / integer
+                   duration-literal / constant / string-lit / hex-int / integer
+  (* bpftrace duration literals: `100ms', `1s', `5us', `1ns'.
+     Convert to nanoseconds at parse time (`100ms' → 100_000_000).
+     Must precede `constant' so `ms' / `us' / `s' / `ns' don't get
+     eaten as bare identifiers. *)
+  duration-literal = integer duration-unit
+  duration-unit  = 'ms' / 'us' / 'ns' / 's'
   (* `{ stmt; stmt; … expr }' — bpftrace 0.22+ block expression. Each
      statement runs in order; the final unterminated expr is the
      block's value. Distinct from `block' (which produces no value

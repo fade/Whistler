@@ -899,6 +899,7 @@
     (:args       (unsupported "args without ->field"))
     (:probe-name (unsupported "probe builtin"))
     (:func       (unsupported "func builtin"))
+    (:incdec-expr (lower-incdec-expr expr))
     (:bin        (lower-bin expr))
     (:un         (lower-un expr))
     (:tern       (lower-tern expr))
@@ -3655,7 +3656,12 @@
                    (:block-expr
                     (mapc (lambda (s) (walk-stmt s seen skip))
                           (getf (cdr form) :stmts))
-                    (walk (getf (cdr form) :final) skip)))))
+                    (walk (getf (cdr form) :final) skip))
+                   ;; `$x++' / `++$x' / `@m[k]++' used as an expr.
+                   ;; The LHS is a place expr — descend so the var
+                   ;; (or map's key sub-exprs) get collected.
+                   (:incdec-expr
+                    (walk (getf (cdr form) :lhs) skip)))))
              (walk-stmt (s _seen skip)
                (declare (ignore _seen))
                (case (first s)
@@ -4552,6 +4558,51 @@
                       (4 (intern "U32" :whistler))
                       (t (intern "U64" :whistler)))))
     `(whistler::store ,store-type ,buf ,offset ,(lower-expr key-expr))))
+
+(defun lower-incdec-expr (expr)
+  "Lower `$x++' / `++$x' / `@m[k]++' / `++@m[k]' used as an expression
+   (e.g. inside a printf arg). The statement variant `$x++;' already
+   has a handler in lower-incdec; this version preserves the value
+   for the surrounding expression. Postfix returns the pre-increment
+   value via `prog1'; prefix returns the post-increment value."
+  (let* ((lhs  (getf (cdr expr) :lhs))
+         (op   (getf (cdr expr) :op))
+         (form (getf (cdr expr) :form)))
+    (ecase (first lhs)
+      (:var
+       (let ((sym (var-sym (second lhs))))
+         (ecase form
+           (:post
+            (let ((tmp (gensym "POST")))
+              `(let ((,tmp ,sym))
+                 (setq ,sym ,(if (eq op :inc)
+                                 `(whistler::+ ,sym 1)
+                                 `(whistler::- ,sym 1)))
+                 ,tmp)))
+           (:pre
+            `(progn
+               (setq ,sym ,(if (eq op :inc)
+                               `(whistler::+ ,sym 1)
+                               `(whistler::- ,sym 1)))
+               ,sym)))))
+      (:map
+       (let* ((info  (or (gethash (or (getf (cdr lhs) :name) "@") *map-table*)
+                         (error "internal: missing map ~A" (getf (cdr lhs) :name))))
+              (mname (minfo-name info))
+              (keys  (getf (cdr lhs) :keys))
+              (step  (or (minfo-value-ptr-elt-size info) 1)))
+         (with-key keys
+           (lambda (k)
+             (let ((read-form `(whistler:getmap ,mname ,k))
+                   (update (if (eq op :inc)
+                               `(whistler:incf (whistler:getmap ,mname ,k) ,step)
+                               `(whistler:decf (whistler:getmap ,mname ,k) ,step))))
+               (ecase form
+                 (:post (let ((tmp (gensym "POST")))
+                          `(let ((,tmp ,read-form))
+                             ,update
+                             ,tmp)))
+                 (:pre  `(progn ,update ,read-form)))))))))))
 
 (defun lower-incdec (stmt)
   "Lower `$x++' / `$x--' / `++$x' / `--$x' / `@m[k]++' etc. Statement-
