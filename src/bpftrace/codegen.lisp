@@ -3374,6 +3374,21 @@
                           (getf (cdr base) :elt-type)))
            (lower-ptr-index (lower-expr (getf (cdr base) :expr))
                             (lower-expr idx) sz)))
+        ;; `args.FIELD[i]' — subscript on a tracepoint args field.
+        ;; The field is typically a pointer-to-array (`char ** argv'),
+        ;; so its value is an 8-byte userspace pointer; the i'th
+        ;; element is 8 bytes at base+i*8 probed from userspace.
+        ((and (consp base) (eq (first base) :field)
+              (consp (getf (cdr base) :base))
+              (eq (first (getf (cdr base) :base)) :args))
+         (let* ((scratch (gensym "ARGIX"))
+                (idx-form (lower-expr idx))
+                (base-form (lower-args-field (getf (cdr base) :name))))
+           `(let ((,scratch (whistler::struct-alloc 8)))
+              (whistler::probe-read-user
+               ,scratch 8
+               (whistler::+ ,base-form (whistler::* ,idx-form 8)))
+              (whistler::load whistler::u64 ,scratch 0))))
         ;; `@m[k][i]' where @m's value was stored from a primitive-
         ;; pointer cast (`@m[k] = (int32 *) X'). Read sizeof(elt)
         ;; bytes at `@m[k] + i * sizeof(elt)' via probe-read. The
