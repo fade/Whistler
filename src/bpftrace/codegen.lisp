@@ -818,12 +818,20 @@
          (parent (gensym "PPARENT")))
     (unless (and rp-off co-off)
       (unsupported "pcomm: vmlinux BTF missing task_struct.real_parent/comm"))
-    `(let ((,parent (whistler::struct-alloc 8)))
-       (whistler::probe-read-kernel
-        ,parent 8 (whistler::+ (whistler::get-current-task) ,rp-off))
-       (whistler::probe-read-kernel
-        (+ ,rec ,off) ,size
-        (whistler::+ (whistler::load whistler::u64 ,parent 0) ,co-off)))))
+    ;; let*-bind dst-ptr and src-ptr so each gets a stable surface vreg.
+    ;; Without this staging, the verifier rejects naptime.bt's printf:
+    ;; the codegen for the inline `(+ rec off)' dst expression and the
+    ;; size constant 16 both land in R1 across the helper call setup,
+    ;; clobbering the dst pointer before bpf_probe_read_kernel runs.
+    (let ((dst-ptr (gensym "PCOMM-DST"))
+          (src-ptr (gensym "PCOMM-SRC")))
+      `(let ((,parent (whistler::struct-alloc 8)))
+         (whistler::probe-read-kernel
+          ,parent 8 (whistler::+ (whistler::get-current-task) ,rp-off))
+         (let* ((,dst-ptr (whistler::+ ,rec ,off))
+                (,src-ptr (whistler::+ (whistler::load whistler::u64 ,parent 0)
+                                       ,co-off)))
+           (whistler::probe-read-kernel ,dst-ptr ,size ,src-ptr))))))
 
 (defun lower-ppid-builtin ()
   "Parent PID — walk `current_task->real_parent->tgid'. real_parent
