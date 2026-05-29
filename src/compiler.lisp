@@ -51,7 +51,9 @@
     ;; kprobe scripts the verifier rejects. We expose it under
     ;; bpftrace's `path()' macro and let the verifier surface the
     ;; per-probe limitation.
-    ("D-PATH"               . 147))
+    ("D-PATH"               . 147)
+    ("SEND-SIGNAL"          . 109)
+    ("OVERRIDE-RETURN"      . 58))
   "BPF helper functions: string name → helper ID.
    Single source of truth — referenced by the SSA pipeline via lower.lisp.")
 
@@ -60,6 +62,7 @@
     ("PROBE-READ-STR" . 3) ("PROBE-READ-USER-STR" . 3)
     ("PROBE-READ-KERNEL-STR" . 3)
     ("D-PATH" . 3)
+    ("SEND-SIGNAL" . 1) ("OVERRIDE-RETURN" . 2)
     ("KTIME-GET-NS" . 0) ("GET-PRANDOM-U32" . 0) ("GET-CURRENT-TASK" . 0)
     ("GET-SMP-PROCESSOR-ID" . 0) ("GET-CURRENT-CGROUP-ID" . 0)
     ("GET-CURRENT-PID-TGID" . 0) ("GET-CURRENT-UID-GID" . 0)

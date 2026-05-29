@@ -838,6 +838,73 @@
                    (whistler:getmap ,*elapsed-map-name* 0)))
     (t       (unsupported "builtin ~A" kw))))
 
+(defun lower-fail (args)
+  "fail(\"FMT\", LITERAL…) — compile-time static assert. If every arg
+   is a literal we format the message now and signal an error so the
+   build halts (matching bpftrace's semantics). With non-literal
+   args we route to runtime errorf instead."
+  (unless args
+    (unsupported "fail() with no message"))
+  (let ((fmt (first args)))
+    (unless (eq (first fmt) :str)
+      (unsupported "fail() format must be a string literal"))
+    (let* ((fmt-str (second fmt))
+           (extras  (rest args))
+           (literal-p (every (lambda (a)
+                               (and (consp a)
+                                    (member (first a) '(:int :str))))
+                             extras)))
+      (cond
+        (literal-p
+         (let ((msg (apply #'format nil
+                           (substitute-c-printf-to-cl fmt-str)
+                           (mapcar (lambda (a)
+                                     (if (eq (first a) :str) (second a) (second a)))
+                                   extras))))
+           (whistler/compiler:whistler-error :what (format nil "fail(): ~A" msg))))
+        (t
+         (lower-printf args :stream :stderr :fn-name "fail"))))))
+
+(defun substitute-c-printf-to-cl (fmt)
+  "Translate the subset of C printf directives we actually use
+   (%d / %u / %x / %s) to CL FORMAT directives, so the compile-time
+   `fail()' formatter can render literal args without involving the
+   runtime decoder."
+  (with-output-to-string (out)
+    (loop with i = 0 with n = (length fmt)
+          while (< i n)
+          do (let ((c (char fmt i)))
+               (cond
+                 ((char= c #\%)
+                  (let ((j (1+ i)))
+                    ;; skip flags/width/precision
+                    (loop while (and (< j n)
+                                     (find (char fmt j) "-+0123456789. l"))
+                          do (incf j))
+                    (when (< j n)
+                      (case (char fmt j)
+                        ((#\d #\i #\u) (write-string "~D" out))
+                        ((#\x #\X)     (write-string "~X" out))
+                        ((#\s)         (write-string "~A" out))
+                        ((#\%)         (write-string "%" out))
+                        (t (write-string "%?" out)))
+                      (setf i (1+ j)))))
+                 ((char= c #\~) (write-string "~~" out) (incf i))
+                 (t (write-char c out) (incf i)))))))
+
+(defun lower-cgroupid (args)
+  "Resolve cgroupid(\"/sys/fs/cgroup/PATH\") at compile time by stat'ing
+   the directory and emitting its inode number as a literal."
+  (unless (and (= (length args) 1)
+               (consp (first args))
+               (eq (first (first args)) :str))
+    (unsupported "cgroupid(): arg must be a string literal path"))
+  (let* ((path (second (first args)))
+         (stat (ignore-errors (sb-posix:stat path))))
+    (unless stat
+      (unsupported "cgroupid(): could not stat ~S" path))
+    (sb-posix:stat-ino stat)))
+
 (defun parse-ipv4 (s)
   "Parse `1.2.3.4' → list of 4 octets, or NIL on bad input."
   (let ((parts (loop with acc = nil
@@ -1203,6 +1270,7 @@
 (defconstant +bt-tag-time+      3)
 (defconstant +bt-tag-cat+       4)
 (defconstant +bt-tag-join+      5)
+(defconstant +bt-tag-system+    6)
 (defconstant +bt-join-argnum+   16
   "Maximum NULL-terminated string array entries `join()' captures.
    Matches bpftrace's default.")
@@ -1231,6 +1299,22 @@
        ;; Set the exit flag the userspace print loop polls every tick.
        `(setf (whistler:getmap ,*exit-map-name* 0) 1))
       ((string= name "printf") (lower-printf (getf (cdr expr) :args)))
+      ;; errorf("fmt", …) — same as printf() but the userspace decoder
+      ;; routes the line to *error-output* (stderr).
+      ((string= name "errorf")
+       (lower-printf (getf (cdr expr) :args)
+                     :stream :stderr :fn-name "errorf"))
+      ;; warnf("fmt", …) — same as errorf but the userspace decoder
+      ;; prepends `WARNING: ' so it matches bpftrace's render.
+      ((string= name "warnf")
+       (lower-printf (getf (cdr expr) :args)
+                     :stream :stderr-warning :fn-name "warnf"))
+      ;; fail("fmt", …) — compile-time static-assert. bpftrace
+      ;; evaluates the literal args at compile time and aborts the
+      ;; build with the message. We do the same when every arg is
+      ;; a literal; otherwise we punt to runtime errorf so the user
+      ;; still sees a message in dev workflows.
+      ((string= name "fail") (lower-fail (getf (cdr expr) :args)))
       ((string= name "print")  (lower-async-map +bt-tag-print-map+
                                                 (getf (cdr expr) :args)
                                                 "print"))
@@ -1241,6 +1325,10 @@
       ((string= name "time")   (lower-async-time
                                 (getf (cdr expr) :args)))
       ((string= name "cat")    (lower-async-cat
+                                (getf (cdr expr) :args)))
+      ;; system("cmd") — async event. The literal command is interned
+      ;; under an id; userspace runs it via the shell at decode time.
+      ((string= name "system") (lower-async-system
                                 (getf (cdr expr) :args)))
       ((string= name "join")   (lower-async-join
                                 (getf (cdr expr) :args)))
@@ -1320,6 +1408,30 @@
        (lower-expr (first (getf (cdr expr) :args))))
       ((string= name "strncmp") (lower-strncmp (getf (cdr expr) :args)))
       ((string= name "pton")    (lower-pton (getf (cdr expr) :args)))
+      ;; cgroupid("/sys/fs/cgroup/PATH") — compile-time stat() of
+      ;; the cgroup directory; emits its inode number as a literal.
+      ;; Used for `kprobe:foo /cgroup == cgroupid("/sys/fs/cgroup/my")/'
+      ;; filtering. bpftrace mirrors this contract exactly.
+      ((string= name "cgroupid") (lower-cgroupid (getf (cdr expr) :args)))
+      ;; socket_cookie(sk) — kernel helper #46. Stable per-socket
+      ;; identifier; survives across CPUs and reuse so it's safer
+      ;; than a sock-pointer key.
+      ((string= name "socket_cookie")
+       `(whistler::get-socket-cookie
+         ,(lower-expr (first (getf (cdr expr) :args)))))
+      ;; signal(N) — bpf_send_signal. Sends the given signal to the
+      ;; current task. Returns 0 on success.
+      ((string= name "signal")
+       `(whistler::send-signal
+         ,(lower-expr (first (getf (cdr expr) :args)))))
+      ;; override(retval) — bpf_override_return. Replaces the
+      ;; kprobed function's return value. Requires the target
+      ;; function to be marked CONFIG_FUNCTION_ERROR_INJECTION.
+      ;; Only valid inside kprobe (not kretprobe).
+      ((string= name "override")
+       `(whistler::override-return
+         (whistler::ctx-ptr)
+         ,(lower-expr (first (getf (cdr expr) :args)))))
       ;; User-defined `fn' — inline the body, substituting the
       ;; formal parameters with the actual argument expressions.
       ((find-user-function name)
@@ -1588,6 +1700,11 @@
    an ID; the kernel emits (tag, id) and userspace looks the format
    up to strftime it.")
 
+(defvar *system-cmds-table* nil
+  "Per-generate() alist (ID . COMMAND-STRING). Each system() call
+   registers under a unique ID; the kernel emits (tag, id) and
+   userspace runs the command at print-loop time via SB-EXT:RUN-PROGRAM.")
+
 (defvar *cat-paths-table* nil
   "Per-generate() alist (ID . PATH). cat(PATH) registers the path
    under a unique ID; the kernel emits (tag, id) and userspace
@@ -1633,6 +1750,22 @@
     (push (cons id path) *cat-paths-table*)
     `(whistler:with-ringbuf (,rec ,*print-map-name* 8)
        (whistler::store ,(intern "U32" :whistler) ,rec 0 ,+bt-tag-cat+)
+       (whistler::store ,(intern "U32" :whistler) ,rec 4 ,id))))
+
+(defun lower-async-system (args)
+  "Emit a tagged ringbuf record asking userspace to spawn the literal
+   command. Only literal commands today — matches what bpftrace
+   itself supports."
+  (unless (and (= (length args) 1)
+               (consp (first args))
+               (eq (first (first args)) :str))
+    (unsupported "system() arg must be a string literal command"))
+  (let* ((cmd (second (first args)))
+         (id (1+ (length *system-cmds-table*)))
+         (rec (gensym "REC")))
+    (push (cons id cmd) *system-cmds-table*)
+    `(whistler:with-ringbuf (,rec ,*print-map-name* 8)
+       (whistler::store ,(intern "U32" :whistler) ,rec 0 ,+bt-tag-system+)
        (whistler::store ,(intern "U32" :whistler) ,rec 4 ,id))))
 
 (defun lower-async-time (args)
@@ -1833,24 +1966,27 @@
     ((and (consp arg-type) (eq (car arg-type) :strftime)) 8)  ; just the u64 timestamp
     (t (error "printf-arg-size: unrecognised ~A" arg-type))))
 
-(defun lower-printf (args)
+(defun lower-printf (args &key (stream :stdout) (fn-name "printf"))
   "Lower a bpftrace `printf(\"FMT\", arg…)` to a ringbuf-submit using
-   the unified async-action protocol.
+   the unified async-action protocol. STREAM picks where the
+   userspace decoder routes the formatted line — :stdout (default),
+   :stderr (for errorf / warnf), or :stderr-prefixed (warnf prepends
+   `WARNING: ').
 
    Record layout (all little-endian):
      0:  u32 tag = +bt-tag-printf+
      4:  u32 id  (index into the printf-table)
      8+: per-arg payloads — u64 for :int args, 16 bytes for :string
 
-   At codegen time we register (id fmt-string arg-types) in
+   At codegen time we register (id fmt-string arg-types stream) in
    *PRINTF-TABLE*, which the runtime gets via :printf-table in the
    generate() plist. The runtime ring-consumer reads the tag, then
    the id, then walks ARG-TYPES to decode each payload."
   (unless args
-    (unsupported "printf() with no format string"))
+    (unsupported "~A() with no format string" fn-name))
   (let ((fmt (first args)))
     (unless (eq (first fmt) :str)
-      (unsupported "printf() format must be a string literal"))
+      (unsupported "~A() format must be a string literal" fn-name))
     (let* ((fmt-str    (second fmt))
            (extra-args (rest args))
            (arg-types  (mapcar #'printf-arg-type extra-args))
@@ -1862,7 +1998,7 @@
                                do (incf o (printf-arg-size ty)))))
            (total-size (+ 8 (loop for ty in arg-types sum (printf-arg-size ty))))
            (rec        (gensym "REC")))
-      (push (list id fmt-str arg-types) *printf-table*)
+      (push (list id fmt-str arg-types stream) *printf-table*)
       `(whistler:with-ringbuf (,rec ,*print-map-name* ,total-size)
          (whistler::store ,(intern "U32" :whistler) ,rec 0 ,+bt-tag-printf+)
          (whistler::store ,(intern "U32" :whistler) ,rec 4 ,id)
@@ -4227,6 +4363,7 @@
          (*printf-id-counter* 0)
          (*time-format-table* nil)
          (*cat-paths-table* nil)
+         (*system-cmds-table* nil)
          (*map-id-table* nil)
          (*max-scratch-bytes* 0)
          ;; Fold `comm()' / `pid()' / etc. → bare builtins BEFORE the
@@ -4311,6 +4448,7 @@
           :printf-table (reverse *printf-table*)
           :time-format-table (reverse *time-format-table*)
           :cat-paths-table (reverse *cat-paths-table*)
+          :system-cmds-table (reverse *system-cmds-table*)
           :map-id-table (reverse *map-id-table*)
           :info (loop for raw being the hash-keys of map-table
                       using (hash-value info)

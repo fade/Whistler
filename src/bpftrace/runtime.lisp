@@ -1350,7 +1350,20 @@
                                                  sap off size)
                                            (incf off size))))
                                       (t (error "unknown printf arg type ~A" ty)))))))
-        (write-string (format-printf fmt args))))))
+        ;; printf-table entries gained a 4th element (the stream
+        ;; routing kind) for the errorf / warnf split. Older entries
+        ;; without it default to :stdout.
+        (let* ((stream (or (fourth entry) :stdout))
+               (rendered (format-printf fmt args))
+               (line (case stream
+                       (:stderr-warning
+                        (concatenate 'string "WARNING: " rendered))
+                       (t rendered))))
+          (case stream
+            ((:stderr :stderr-warning)
+             (write-string line *error-output*)
+             (force-output *error-output*))
+            (t (write-string line))))))))
 
 (defun format-ipv6 (sap off)
   "Render 16 bytes at SAP+OFF as an IPv6 address. Compresses the
@@ -1566,9 +1579,22 @@
                   do (write-line line)))
         (error () (format t "cat(\"~A\"): unable to read~%" path))))))
 
+(defun decode-system-record (sap system-cmds-table)
+  "Spawn the userspace command interned at the id at offset 4. Runs
+   through /bin/sh -c so shell metacharacters work, matching
+   bpftrace's `system(\"…\")' semantics."
+  (let* ((id  (sap-read-u32-le sap 4))
+         (cmd (cdr (assoc id system-cmds-table :test #'=))))
+    (when cmd
+      (handler-case
+          (sb-ext:run-program "/bin/sh" (list "-c" cmd)
+                              :output t :error t :wait t)
+        (error (e)
+          (format *error-output* "system(\"~A\"): ~A~%" cmd e))))))
+
 (defun make-ring-callback (printf-table map-id-table map-alist info-list
                            &key stacks-info stack-depth time-format-table
-                                cat-paths-table)
+                                cat-paths-table system-cmds-table)
   "Build the dispatcher that READ_RING_BUFFER invokes for every record."
   (lambda (sap len)
     (declare (ignore len))
@@ -1581,6 +1607,7 @@
         (3 (decode-time-record      sap time-format-table))
         (4 (decode-cat-record       sap cat-paths-table))
         (5 (decode-join-record      sap))
+        (6 (decode-system-record    sap system-cmds-table))
         (t nil)))
     (force-output)))
 
@@ -1646,6 +1673,7 @@
            (printf-table (getf gen :printf-table))
            (time-format-table (getf gen :time-format-table))
            (cat-paths-table (getf gen :cat-paths-table))
+           (system-cmds-table (getf gen :system-cmds-table))
            (map-id-table (getf gen :map-id-table))
            (info-list-cached info-list)
            (ring-consumer
@@ -1657,7 +1685,8 @@
                                     :stacks-info stacks-info
                                     :stack-depth stack-depth
                                     :time-format-table time-format-table
-                                    :cat-paths-table cat-paths-table))))
+                                    :cat-paths-table cat-paths-table
+                                    :system-cmds-table system-cmds-table))))
            (begin-progs (remove-if-not
                          (lambda (entry)
                            (begin-section-p
