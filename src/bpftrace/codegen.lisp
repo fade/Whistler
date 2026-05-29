@@ -1684,6 +1684,19 @@
       ;; Folds to fail() when cond is a literal-false expression.
       ((string= name "static_assert")
        (lower-static-assert (getf (cdr expr) :args)))
+      ;; assert_str(exp) — compile-time check that EXP has string
+      ;; type. bpftrace's stdlib spelling expands to nested ifs over
+      ;; is_str / is_ptr; for us it folds straight to a 0 (no-op) or
+      ;; whistler-error so the build halts early.
+      ((string= name "assert_str")
+       (cond
+         ((/= 1 (length (getf (cdr expr) :args)))
+          (unsupported "assert_str() takes one argument"))
+         ((ast-matches-type-p (first (getf (cdr expr) :args)) "is_str") 0)
+         (t (whistler/compiler:whistler-error
+             :what (format nil
+                           "assert_str: expression ~S is not a string"
+                           (first (getf (cdr expr) :args)))))))
       ;; cpid() / has_cpid() — child PID from `-c CMD'. Resolved
       ;; at codegen time from whistler/bpftrace:*child-cpid*, which
       ;; the CLI binds before compile-script runs.

@@ -1213,6 +1213,8 @@
                                    ((#\u)     (format nil "~D" (or arg 0)))
                                    ((#\x #\p) (format nil "~(~X~)" (or arg 0)))
                                    ((#\X)     (format nil "~X" (or arg 0)))
+                                   ((#\o)     (format nil "~O" (or arg 0)))
+                                   ((#\b)     (format nil "~B" (or arg 0)))
                                    ((#\c)     (string (code-char (logand (or arg 0) #xff))))
                                    ((#\s)     (let ((str (if (stringp arg) arg "")))
                                                 (if (and precision (> (length str) precision))
