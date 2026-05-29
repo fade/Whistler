@@ -469,6 +469,25 @@
     (setf *syscall-name-table* (build-syscall-name-table)))
   (or (gethash id *syscall-name-table*) "unknown_syscall"))
 
+(defparameter *signal-names*
+  ;; POSIX signal numbers are stable across Linux architectures (up to 31;
+  ;; the realtime range varies but its names don't). Stop at 31 and let
+  ;; the rest render as `SIG<NN>'.
+  '((1 . "SIGHUP")  (2 . "SIGINT")  (3 . "SIGQUIT") (4 . "SIGILL")
+    (5 . "SIGTRAP") (6 . "SIGABRT") (7 . "SIGBUS")  (8 . "SIGFPE")
+    (9 . "SIGKILL") (10 . "SIGUSR1") (11 . "SIGSEGV") (12 . "SIGUSR2")
+    (13 . "SIGPIPE") (14 . "SIGALRM") (15 . "SIGTERM") (16 . "SIGSTKFLT")
+    (17 . "SIGCHLD") (18 . "SIGCONT") (19 . "SIGSTOP") (20 . "SIGTSTP")
+    (21 . "SIGTTIN") (22 . "SIGTTOU") (23 . "SIGURG")  (24 . "SIGXCPU")
+    (25 . "SIGXFSZ") (26 . "SIGVTALRM") (27 . "SIGPROF") (28 . "SIGWINCH")
+    (29 . "SIGIO")   (30 . "SIGPWR")  (31 . "SIGSYS")))
+
+(defun signal-id->name (id)
+  "Map a signal number to its symbolic name. Falls back to `SIG<id>'
+   for values outside the standard POSIX set (e.g. realtime signals)."
+  (or (cdr (assoc id *signal-names*))
+      (format nil "SIG~D" id)))
+
 (defun format-key (key &key (parts 1) key-builtin)
   "Render KEY (an integer) as bpftrace does.
    * KEY-BUILTIN :comm or :str — KEY's PARTS*8 little-endian bytes
@@ -481,6 +500,8 @@
      (format nil "~A" (bignum->string key (* parts 8))))
     ((eq key-builtin :syscall-name)
      (syscall-id->name key))
+    ((eq key-builtin :signal-name)
+     (signal-id->name key))
     ((<= parts 1) (format nil "~D" key))
     (t
      (with-output-to-string (s)

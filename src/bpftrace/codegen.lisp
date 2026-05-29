@@ -241,6 +241,7 @@
     (:ustack  :ustack)
     (:call    (cond ((or (str-call-p expr) (kstr-call-p expr)) :str)
                     ((named-call-p expr "syscall_name") :syscall-name)
+                    ((named-call-p expr "signal_name")  :signal-name)
                     (t nil)))
     (t        nil)))
 
@@ -1185,6 +1186,10 @@
       ;; `@m[syscall_name(args.id)] = count()' but not as a printf %s
       ;; arg — that needs kernel-side string-table lookup.
       ((string= name "syscall_name")
+       (lower-expr (first (getf (cdr expr) :args))))
+      ;; `signal_name(N)' — same pattern: passes N (the signal number)
+      ;; through and tags the key column for userspace rendering.
+      ((string= name "signal_name")
        (lower-expr (first (getf (cdr expr) :args))))
       ;; User-defined `fn' — inline the body, substituting the
       ;; formal parameters with the actual argument expressions.
