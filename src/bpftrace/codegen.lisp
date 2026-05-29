@@ -63,6 +63,10 @@
                    ;   uses this with key-array-len to render keys as
                    ;   `[v1,v2,…]' matching bpftrace's array-key style.
   key-array-len    ; Number of elements in the array key when set.
+  needs-len-counter-p ; T when any `len(@m)' in the script targets
+                   ;   this map. Triggers emission of a `__len_NAME'
+                   ;   sidecar (1-entry percpu-array u64) and the
+                   ;   incf/decf injection on update/delete sites.
   hist-params)     ; for :lhist, the list (MIN MAX STEP); NIL otherwise.
 
 (defun builtin-size (kw)
@@ -487,7 +491,21 @@
                    (t (when (eq (minfo-kind info) :counter)
                         (setf (minfo-kind info) :scalar)))))))
       (labels
-          ((scan-stmt (stmt)
+          ((note-len-target (e)
+             ;; Walk E for any `len(@m)' call; flag every map argument
+             ;; so a `__len_NAME' sidecar counter map gets emitted.
+             (cond
+               ((not (consp e)) nil)
+               ((and (eq (first e) :call)
+                     (string= (getf (cdr e) :name) "len")
+                     (let ((arg (first (getf (cdr e) :args))))
+                       (and (consp arg) (eq (first arg) :map))))
+                (setf (minfo-needs-len-counter-p
+                       (ensure (first (getf (cdr e) :args))))
+                      t))
+               (t (some #'note-len-target e))))
+           (scan-stmt (stmt)
+             (note-len-target stmt)
              (case (first stmt)
                (:assign
                 (let ((lhs (getf (cdr stmt) :lhs))
@@ -1231,10 +1249,24 @@
 
 (defun lower-len (args)
   "len(s) for a string-typed $var or `comm' / `pcomm' — walk the
-   slot byte-by-byte until the first NUL, return the offset. Falls
-   back to the slot capacity when no NUL is found."
+   slot byte-by-byte until the first NUL, return the offset. For
+   `len(@m)' (a map ref), reads the sidecar counter map that
+   infer-maps tagged the map with."
   (unless (= (length args) 1)
     (unsupported "len() takes one argument"))
+  (let ((arg (first args)))
+    ;; Map form: `len(@m)' — read the sidecar counter.
+    (when (and (consp arg) (eq (first arg) :map))
+      (let* ((info (or (gethash (or (getf (cdr arg) :name) "@") *map-table*)
+                       (unsupported "len(): unknown map @~A"
+                                    (getf (cdr arg) :name)))))
+        (unless (minfo-needs-len-counter-p info)
+          ;; Should be set by infer-maps; if not, the script slipped
+          ;; past our walker.
+          (unsupported "len(@~A): internal — sidecar counter not registered"
+                       (or (minfo-raw-name info) "")))
+        (return-from lower-len
+          `(whistler:getmap ,(len-counter-sym info) 0)))))
   (let* ((arg (first args))
          (cap (cond
                 ((eq (first arg) :comm)  +bt-comm-len+)
@@ -1242,7 +1274,7 @@
                 ((and (eq (first arg) :var)
                       (string-var-buf-size (second arg))))
                 (t (unsupported
-                    "len(): arg must be `comm', `pcomm', or a string-typed $var"))))
+                    "len(): arg must be `comm', `pcomm', a string-typed $var, or `@m'"))))
          (buf-form
            (cond
              ((eq (first arg) :comm)
@@ -1725,6 +1757,13 @@
   `(whistler::if ,(lower-expr (getf (cdr expr) :cond))
                       ,(lower-expr (getf (cdr expr) :then))
                       ,(lower-expr (getf (cdr expr) :else))))
+
+(defun len-counter-sym (info)
+  "Symbol for the `len(@m)' sidecar counter map. Built off the
+   user map's whistler symbol so naming collisions can't happen."
+  (intern (concatenate 'string "__LEN_"
+                       (symbol-name (minfo-name info)))
+          :whistler))
 
 (defparameter *exit-map-name* (intern "--BT-EXIT--" :whistler)
   "Hidden array map used as a kernel→user `exit()` flag.")
@@ -3881,11 +3920,31 @@
                  ,slot-sym 16 ,(lower-chain-as-ptr addr-expr)))
             (whistler::store whistler::u8 ,slot-sym 16 ,fam)))))))
 
+(defun maybe-bump-len-counter (info op delta)
+  "Returns a Lisp form to bump (or no-op) the len(@m) sidecar
+   counter for INFO. Plain `=' that touches a single key adds 1; the
+   `:+=' / `:-=' arms don't change entry count. DELTA is the signed
+   delta to apply (+1 on assign, -1 on delete). NIL when the map
+   doesn't have a sidecar."
+  (when (and (minfo-needs-len-counter-p info)
+             (or (eq op :=) (eq op :delete)))
+    (let ((sym (len-counter-sym info)))
+      (if (plusp delta)
+          `(whistler:incf (whistler:getmap ,sym 0) ,delta)
+          `(whistler:decf (whistler:getmap ,sym 0) ,(- delta))))))
+
+(defun wrap-with-len-counter (info op form)
+  "When INFO is a `len(@m)'-targeted map and OP changes the entry
+   count, append a counter-bump after FORM and wrap in `progn'."
+  (let ((bump (maybe-bump-len-counter info op 1)))
+    (if bump `(progn ,form ,bump) form)))
+
 (defun lower-map-assign (mref op rhs)
   (let* ((info (or (gethash (or (getf (cdr mref) :name) "@") *map-table*)
                    (error "internal: missing map ~A" (getf (cdr mref) :name))))
          (mname (minfo-name info))
          (keys  (getf (cdr mref) :keys)))
+    (wrap-with-len-counter info op
     (cond
       ((and (consp rhs) (eq (first rhs) :call))
        (let ((fn (getf (cdr rhs) :name)))
@@ -3973,7 +4032,7 @@
             (minfo-value-ntop-p info))
        (gen-ntop-set info keys (getf (cdr rhs) :args)))
       (t (gen-scalar-set mname keys (lower-expr rhs) op
-                         :ptr-elt-size (minfo-value-ptr-elt-size info))))))
+                         :ptr-elt-size (minfo-value-ptr-elt-size info)))))))
 
 (defun gen-str-set (info keys ptr-expr user-p)
   "Store the NUL-terminated string at PTR-EXPR as @MNAME[KEYS]'s
@@ -4358,9 +4417,13 @@
                       ((>= (length args) 2)        (rest args))))
               (info (or (gethash (or (getf (cdr mref) :name) "@") *map-table*)
                         (error "internal: delete of unknown @map")))
-              (mname (minfo-name info)))
+              (mname (minfo-name info))
+              (bump (maybe-bump-len-counter info :delete -1)))
          (with-key keys
-           (lambda (k) `(whistler:remmap ,mname ,k)))))
+           (lambda (k)
+             (if bump
+                 `(progn (whistler:remmap ,mname ,k) ,bump)
+                 `(whistler:remmap ,mname ,k))))))
       ;; zero() — kernel-side no-op; Phase 3 just skips it.
       ((and (consp e) (eq (first e) :call)
             (string= (getf (cdr e) :name) "zero"))
@@ -5403,6 +5466,17 @@
            (when uses-exit
              `(whistler:defmap ,*exit-map-name*
                 :type :array :key-size 4 :value-size 1 :max-entries 1)))
+         ;; For every @m that `len(@m)' touches, emit a single-entry
+         ;; percpu-array sidecar named `__len_<map>'. The kernel-side
+         ;; update/delete sites incf/decf this counter; len(@m) reads
+         ;; it.
+         (len-counter-map-forms
+           (loop for info being the hash-values of map-table
+                 when (minfo-needs-len-counter-p info)
+                   collect `(whistler:defmap ,(len-counter-sym info)
+                              :type :percpu-array
+                              :key-size 4 :value-size 8
+                              :max-entries 1)))
          (print-map-form
            (when uses-printf
              `(whistler:defmap ,*print-map-name*
@@ -5442,6 +5516,7 @@
                         (when stacks-map-form  (list stacks-map-form))
                         (when elapsed-map-form (list elapsed-map-form))
                         (when scratch-map-form (list scratch-map-form))
+                        len-counter-map-forms
                         maps)
           :progs (append tp-preamble probes)
           :user-probes user
