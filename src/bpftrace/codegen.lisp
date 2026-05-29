@@ -971,6 +971,51 @@
                collect `(whistler::store whistler::u8 ,buf ,i ,b))
        ,buf)))
 
+(defun ast-literal-p (expr)
+  "True when EXPR is a compile-time literal — an :int, :str, or a
+   :constant whose name is in the curated/BTF table."
+  (and (consp expr)
+       (member (first expr) '(:int :str :constant))))
+
+(defun ast-matches-type-p (expr type-name)
+  "Best-effort compile-time type predicate. Returns T when EXPR's
+   shape matches TYPE-NAME (one of \"is_str\" / \"is_ptr\" /
+   \"is_array\" / \"is_integer\" / \"is_unsigned_integer\"). The
+   shape rules below cover the cases user macros typically need;
+   non-trivial typed expressions fall through to NIL rather than
+   guess wrong."
+  (let ((kind
+          (cond
+            ((and (consp expr) (eq (first expr) :int))      :integer)
+            ((and (consp expr) (eq (first expr) :str))      :str)
+            ((and (consp expr) (eq (first expr) :comm))     :str)
+            ((and (consp expr) (eq (first expr) :pcomm))    :str)
+            ((and (consp expr) (eq (first expr) :func))     :str)
+            ((and (consp expr) (eq (first expr) :probe-name)) :str)
+            ;; A :var typed as a comm/str slot is a string.
+            ((and (consp expr) (eq (first expr) :var)
+                  (or (member (second expr) *comm-vars* :test #'string-equal)
+                      (assoc (second expr) *str-vars* :test #'string-equal)))
+             :str)
+            ;; A :var typed as a struct ptr is a pointer.
+            ((and (consp expr) (eq (first expr) :var)
+                  (assoc (second expr) *var-types* :test #'string-equal))
+             :ptr)
+            ;; bare $var with no special typing defaults to integer.
+            ((and (consp expr) (eq (first expr) :var)) :integer)
+            ((and (consp expr) (eq (first expr) :builtin)) :integer)
+            ((and (consp expr) (eq (first expr) :arg))    :integer)
+            ((and (consp expr) (eq (first expr) :retval)) :integer)
+            ((and (consp expr) (eq (first expr) :bin))    :integer)
+            (t nil))))
+    (cond
+      ((string= type-name "is_str")     (eq kind :str))
+      ((string= type-name "is_ptr")     (eq kind :ptr))
+      ((string= type-name "is_array")   nil)  ;; no first-class arrays
+      ((string= type-name "is_integer") (eq kind :integer))
+      ((string= type-name "is_unsigned_integer") (eq kind :integer))
+      (t nil))))
+
 (defun lower-static-assert (args)
   "static_assert(cond, msg) — compile-time predicate. We only know
    `cond' at compile time when it's a literal integer / bool; in
@@ -1582,6 +1627,19 @@
        (or *child-cpid* 0))
       ((and (string= name "has_cpid") (null (getf (cdr expr) :args)))
        (if *child-cpid* 1 0))
+      ;; Compile-time type predicates from bpftrace's meta.bt. Each
+      ;; folds to a 0/1 integer literal based on the argument's AST
+      ;; shape, so generic macros can dispatch with `if comptime'.
+      ((string= name "is_literal")
+       (if (= 1 (length (getf (cdr expr) :args)))
+           (if (ast-literal-p (first (getf (cdr expr) :args))) 1 0)
+           (unsupported "is_literal() takes one argument")))
+      ((or (string= name "is_str") (string= name "is_ptr")
+           (string= name "is_array") (string= name "is_integer")
+           (string= name "is_unsigned_integer"))
+       (if (= 1 (length (getf (cdr expr) :args)))
+           (if (ast-matches-type-p (first (getf (cdr expr) :args)) name) 1 0)
+           (unsupported "~A() takes one argument" name)))
       ((string= name "pton")    (lower-pton (getf (cdr expr) :args)))
       ;; cgroupid("/sys/fs/cgroup/PATH") — compile-time stat() of
       ;; the cgroup directory; emits its inode number as a literal.
