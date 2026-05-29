@@ -209,6 +209,55 @@
            (entry (list* name total-size (nreverse fields))))
       (push entry *script-struct-decls*))))
 
+(defun norm-enum-decl (node)
+  "Parse an `enum [NAME] { K1 [= V1], K2, … };' top-level decl into
+   entries on *script-enum-values*. Members without `= N' follow C
+   auto-increment: first auto = 0, subsequent auto = previous + 1.
+   Hex literals (0xFF) and decimals both accepted; we strip the
+   leading 0x and parse with the explicit radix."
+  (let ((members-node (first-tagged node :enum-members)))
+    (unless members-node (return-from norm-enum-decl nil))
+    (loop with auto = 0
+          for m in (all-tagged members-node :enum-member)
+          for name = (text-of (first-tagged m :ident))
+          for hex  = (first-tagged m :hex-int)
+          for dec  = (first-tagged m :integer)
+          for value = (cond
+                        (hex (parse-integer (text-of hex)
+                                            :start 2 :radix 16))
+                        (dec (parse-integer (text-of dec)))
+                        (t auto))
+          do (pushnew (cons name value) *script-enum-values*
+                      :test #'equal :key #'car)
+             (setf auto (1+ value)))))
+
+(defun resolve-unroll-count (expr-node)
+  "Resolve unroll(N)'s count argument at AST time. Accepts a literal
+   integer (`unroll(10)') or a `$N' positional (`unroll($1)') — the
+   latter looks up *positional-args* and parses the argv token. Any
+   other shape returns NIL so the caller can error."
+  (cond
+    ((not expr-node) nil)
+    ;; A bare integer parse-tree node — `unroll(10)'.
+    ((and (consp expr-node)
+          (find-if (lambda (c)
+                     (and (consp c) (eq (tag-of c) :integer)))
+                   (children-of expr-node)
+                   :key (constantly nil)))
+     nil)
+    (t
+     ;; Normalize the expr and inspect the resulting AST.
+     (let ((normalized (norm-expr-dispatch expr-node)))
+       (cond
+         ((and (consp normalized) (eq (first normalized) :int))
+          (second normalized))
+         ((and (consp normalized) (eq (first normalized) :positional))
+          (let* ((n   (second normalized))
+                 (tok (and (boundp '*positional-args*)
+                           (nth (1- n) (symbol-value '*positional-args*)))))
+            (and tok (parse-integer tok :junk-allowed t))))
+         (t nil))))))
+
 ;;; ========== Main entry ==========
 
 (defun parse-config-body (body)
@@ -255,6 +304,14 @@
    this before falling back to vmlinux BTF in lower-struct-pointer-
    field, offsetof, and sizeof. Bound by NORMALIZE.")
 
+(defvar *script-enum-values* nil
+  "Alist mapping bare enum-member names (`ONE', `TWO', …) declared at
+   script top-level via `enum [NAME] { … };' to their integer value.
+   Members without explicit values follow C's auto-increment rule:
+   first auto = 0, subsequent auto = previous + 1. Codegen's
+   resolve-constant consults this before failing with `unknown
+   identifier'. Bound by NORMALIZE.")
+
 (defun normalize (raw)
   "Convert the iparse parse tree RAW into the typed AST, then apply
    post-parse rewrites (auto-prepend pid to ustack-keyed maps).
@@ -264,6 +321,7 @@
   (assert (eq (tag-of raw) :script) (raw) "expected :SCRIPT root, got ~S" (tag-of raw))
   (setf *script-config* nil)
   (setf *script-struct-decls* nil)
+  (setf *script-enum-values* nil)
   (rewrite-ustack-pids
    (cons :script
          (loop for top in (all-tagged raw :top-form)
@@ -283,7 +341,9 @@
                               (:struct-decl
                                (norm-struct-decl inner)
                                nil)
-                              (:enum-decl    nil)  ; accept-and-ignore
+                              (:enum-decl
+                               (norm-enum-decl inner)
+                               nil)
                               (:union-decl   nil)  ; accept-and-ignore
                               (:map-decl     nil)  ; accept-and-ignore
                               (t (error "unexpected top-form: ~S"
@@ -431,7 +491,12 @@
   (when node
     (let ((stmts-node (first-tagged node :statements)))
       (when stmts-node
-        (mapcar #'norm-statement (all-tagged stmts-node :statement))))))
+        (loop for s in (all-tagged stmts-node :statement)
+              for normalized = (norm-statement s)
+              if (and (consp normalized) (eq (first normalized) :seq))
+                append (rest normalized)
+              else
+                collect normalized)))))
 
 (defun norm-statement (node)
   (let ((inner (first (remove-if-not #'consp (children-of node)))))
@@ -442,6 +507,23 @@
               (cond-expr (norm-expr-or-expr-wrapped (first kids)))
               (body      (norm-block (second kids))))
          (list :while :cond cond-expr :body body)))
+      (:unroll-stmt
+       ;; Compile-time loop unroller: emit the body N times. N must
+       ;; be a literal integer or a `$1' positional resolved at norm
+       ;; time against *positional-args*. Returns a `(:seq …)' sentinel
+       ;; that norm-block splices into the surrounding list.
+       (let* ((expr-node  (first (loop for c in (children-of inner)
+                                       when (and (consp c)
+                                                 (not (member (tag-of c)
+                                                              '(:block))))
+                                         collect c)))
+              (n          (resolve-unroll-count expr-node))
+              (block-node (first-tagged inner :block))
+              (body       (norm-block block-node)))
+         (unless n
+           (error "unroll(N): N must be a literal integer or $N positional"))
+         (cons :seq
+               (loop repeat n append (copy-tree body)))))
       (:for-stmt
        (let* ((ident-node (first-tagged inner :ident))
               (name       (text-of ident-node))

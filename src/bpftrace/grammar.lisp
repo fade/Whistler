@@ -173,10 +173,11 @@
   script         = <ws> top-form (<ws> top-form)* <ws>
   top-form       = function / macro-decl / config-block / map-decl / struct-decl / enum-decl / union-decl / probe
   (* `enum [NAME] { K1 = V1, K2, … };' at script top-level. Parsed
-     just to clear the way; we don't resolve K-as-constant yet, so
-     scripts that *use* the enum values will fail at codegen with
-     the regular `unknown identifier' error. *)
-  enum-decl      = <'enum'> (<ws> ident)? <ws> <'{'> #'[^}]*' <'}'> (<ws> <';'>)?
+     into named members so bare-ident uses (`print(K1)') resolve to
+     the matching integer. *)
+  enum-decl      = <'enum'> (<ws> ident)? <ws> <'{'> <ws> enum-members? <ws> <'}'> (<ws> <';'>)?
+  enum-members   = enum-member (<ws> <','> <ws> enum-member)* (<ws> <','>)?
+  enum-member    = ident (<ws> <'='> <ws> (hex-int / integer))?
   (* `union N { … };' — accept-and-discard, like enum-decl. Codegen
      doesn't resolve union members yet; scripts using them will hit
      the regular `field access' error at use site. *)
@@ -285,8 +286,12 @@
      elide it after compound statements (if/while/block), so the
      separator is optional. *)
   statements     = statement (<ws> (<';'> <ws>)? statement)* (<ws> <';'>)?
-  statement      = if-stmt / while-stmt / for-stmt / let-stmt / return-stmt /
+  statement      = if-stmt / while-stmt / for-stmt / unroll-stmt / let-stmt / return-stmt /
                    break-stmt / continue-stmt / assign-stmt / expr-stmt
+  (* `unroll(N) { body }' — bpftrace's compile-time loop unroller. N
+     must be a literal integer or `$1' positional. Expanded at AST
+     time by emitting the body N times in place. *)
+  unroll-stmt    = <'unroll'> !ident-char <ws> <'('> <ws> expr <ws> <')'> <ws> block
   return-stmt    = <'return'> !ident-char <ws> expr?
   while-stmt     = <'while'> !ident-char <ws> <'('> <ws> expr <ws> <')'> <ws> block
   (* `for $var : start..end { body }' — range-based for loop. The

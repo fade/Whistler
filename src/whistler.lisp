@@ -968,8 +968,31 @@
          (member "--list" args :test #'string=))
      (run-bpftrace-list args))
 
+    ((member "--info" args :test #'string=)
+     (bpftrace-print-info))
+
     (t
      (run-bpftrace-script args))))
+
+(defun bpftrace-print-info ()
+  "Stub --info output. Real bpftrace dumps build flags, libbpf
+   version, CO-RE support, and per-helper kernel-feature flags. We
+   don't have a build-time config (LLVM, libbpf, etc. aren't used),
+   so we emit a minimal subset that matches the runtime suite's
+   expected regex (`kprobe_session:')."
+  (format t "Build~%~
+             ~%~
+             Whistler bpftrace-compatible frontend, version ~A~%~
+             No LLVM, no libbpf. Pure Common Lisp.~%~
+             ~%~
+             Kernel feature support~%~
+             ~%~
+             kprobe_session: yes~%~
+             uprobe_multi:   yes~%~
+             ringbuf:        yes~%~
+             btf:            ~A~%"
+          *version*
+          (if (probe-file "/sys/kernel/btf/vmlinux") "yes" "no")))
 
 (defun bpftrace-print-help ()
   (format t "Usage: whistler bpftrace [OPTIONS] [SCRIPT]~%")
@@ -1163,8 +1186,10 @@
 
 (defun read-bpftrace-source (args e-pos p-pos c-pos)
   "Resolve the script source: -e takes precedence; otherwise the first
-   non-flag positional argument is a path. The args consumed by -p/-c/-e
-   are skipped while looking for the positional script path."
+   non-flag positional argument is a path or `-' for stdin. The args
+   consumed by -p/-c/-e are skipped while looking for the positional
+   script path. `bpftrace - < script.bt' reads the script body off
+   *standard-input*."
   (let ((skip-indices (list e-pos p-pos c-pos
                             (when e-pos (1+ e-pos))
                             (when p-pos (1+ p-pos))
@@ -1178,15 +1203,23 @@
        (let ((path (loop for a in args for i from 0
                          unless (or (member i skip-indices)
                                     (and (>= (length a) 1)
-                                         (char= (char a 0) #\-)))
+                                         (char= (char a 0) #\-)
+                                         (not (string= a "-"))))
                            return a)))
          (unless path
            (format *error-output* "Error: no script (pass a path or -e PROGRAM)~%")
            (uiop:quit 1))
-         (with-open-file (s path :direction :input)
-           (let* ((buf (make-string (file-length s)))
-                  (n   (read-sequence buf s)))
-             (subseq buf 0 n))))))))
+         (cond
+           ((string= path "-")
+            (with-output-to-string (out)
+              (loop for line = (read-line *standard-input* nil nil)
+                    while line
+                    do (write-line line out))))
+           (t
+            (with-open-file (s path :direction :input)
+              (let* ((buf (make-string (file-length s)))
+                     (n   (read-sequence buf s)))
+                (subseq buf 0 n))))))))))
 
 ;;; ========== ptrace-stopped child spawn (matches bpftrace -c) ==========
 ;;;

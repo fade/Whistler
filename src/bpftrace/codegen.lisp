@@ -968,8 +968,10 @@
 
 (defun resolve-constant (name)
   "Look NAME up in (1) the script's own #define directives, then
-   (2) BTF enums + the curated table. Returns the integer value or NIL."
+   (2) script-level enum decl members, then (3) BTF enums + the
+   curated table. Returns the integer value or NIL."
   (or (cdr (assoc name *user-cpp-defines* :test #'string=))
+      (cdr (assoc name *script-enum-values* :test #'string=))
       (gethash name (constants-table))))
 
 (defun lower-builtin (kw)
@@ -3933,7 +3935,8 @@
             (gen-str-set info keys
                          (first (getf (cdr rhs) :args))
                          (string= fn "str")))
-           (t (gen-scalar-set mname keys (lower-expr rhs) op)))))
+           (t (gen-scalar-set mname keys (lower-expr rhs) op
+                              :ptr-elt-size (minfo-value-ptr-elt-size info))))))
       ;; `@m[k] = "literal"' or `= func' (already rewritten to :str).
       ;; The value slot is value-size bytes wide; lay out the literal
       ;; and NUL-pad. Uses map-update-ptr via with-key's struct path
@@ -3969,7 +3972,8 @@
             (string= (getf (cdr rhs) :name) "ntop")
             (minfo-value-ntop-p info))
        (gen-ntop-set info keys (getf (cdr rhs) :args)))
-      (t (gen-scalar-set mname keys (lower-expr rhs) op)))))
+      (t (gen-scalar-set mname keys (lower-expr rhs) op
+                         :ptr-elt-size (minfo-value-ptr-elt-size info))))))
 
 (defun gen-str-set (info keys ptr-expr user-p)
   "Store the NUL-terminated string at PTR-EXPR as @MNAME[KEYS]'s
@@ -4199,13 +4203,20 @@
         (whistler::store whistler::u64 ,init 0 1)
         (whistler::store whistler::u64 ,init 8 ,v)))))
 
-(defun gen-scalar-set (mname keys value op)
-  (with-key keys
-    (lambda (k)
-      (ecase op
-        (:=  `(setf (whistler:getmap ,mname ,k) ,value))
-        (:+= `(whistler:incf (whistler:getmap ,mname ,k) ,value))
-        (:-= `(whistler:decf (whistler:getmap ,mname ,k) ,value))))))
+(defun gen-scalar-set (mname keys value op &key ptr-elt-size)
+  "Generate a kernel-side update for `@m[k] OP VALUE'. PTR-ELT-SIZE,
+   when set, scales the delta for `+=' / `-=' by sizeof(T) — matching
+   C/bpftrace pointer arithmetic on typed pointers. Plain `=' is
+   never scaled (it writes the raw address)."
+  (let ((delta (if (and ptr-elt-size (or (eq op :+=) (eq op :-=)))
+                   `(whistler::* ,value ,ptr-elt-size)
+                   value)))
+    (with-key keys
+      (lambda (k)
+        (ecase op
+          (:=  `(setf (whistler:getmap ,mname ,k) ,delta))
+          (:+= `(whistler:incf (whistler:getmap ,mname ,k) ,delta))
+          (:-= `(whistler:decf (whistler:getmap ,mname ,k) ,delta)))))))
 
 (defun gen-hist-update (mname keys value-form &optional info)
   "log2 histogram update. KEYS is the surface key list — empty for
@@ -4316,12 +4327,16 @@
        (let* ((info  (or (gethash (or (getf (cdr lhs) :name) "@") *map-table*)
                          (error "internal: missing map ~A" (getf (cdr lhs) :name))))
               (mname (minfo-name info))
-              (keys  (getf (cdr lhs) :keys)))
+              (keys  (getf (cdr lhs) :keys))
+              ;; Pointer arithmetic: when the map's value is a typed
+              ;; pointer (set from an earlier `(T *)' cast), step by
+              ;; sizeof(T) instead of 1.
+              (step  (or (minfo-value-ptr-elt-size info) 1)))
          (with-key keys
            (lambda (k)
              (ecase op
-               (:inc `(whistler:incf (whistler:getmap ,mname ,k)))
-               (:dec `(whistler:decf (whistler:getmap ,mname ,k))))))))
+               (:inc `(whistler:incf (whistler:getmap ,mname ,k) ,step))
+               (:dec `(whistler:decf (whistler:getmap ,mname ,k) ,step)))))))
       (:var
        (let ((sym (var-sym (second lhs))))
          (ecase op
