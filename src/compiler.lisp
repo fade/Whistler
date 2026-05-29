@@ -45,7 +45,13 @@
     ("GET-CURRENT-TASK-BTF" . 159)
     ("KTIME-GET-COARSE-NS"  . 161)
     ("KTIME-GET-BOOT-NS"    . 125)
-    ("GET-STACKID"          . 27))
+    ("GET-STACKID"          . 27)
+    ;; bpf_d_path(struct path *path, char *buf, u32 sz) — only
+    ;; usable from specific LSM/fmod-style probes; for general
+    ;; kprobe scripts the verifier rejects. We expose it under
+    ;; bpftrace's `path()' macro and let the verifier surface the
+    ;; per-probe limitation.
+    ("D-PATH"               . 147))
   "BPF helper functions: string name → helper ID.
    Single source of truth — referenced by the SSA pipeline via lower.lisp.")
 
@@ -53,6 +59,7 @@
   '(("PROBE-READ" . 3) ("PROBE-READ-USER" . 3) ("PROBE-READ-KERNEL" . 3)
     ("PROBE-READ-STR" . 3) ("PROBE-READ-USER-STR" . 3)
     ("PROBE-READ-KERNEL-STR" . 3)
+    ("D-PATH" . 3)
     ("KTIME-GET-NS" . 0) ("GET-PRANDOM-U32" . 0) ("GET-CURRENT-TASK" . 0)
     ("GET-SMP-PROCESSOR-ID" . 0) ("GET-CURRENT-CGROUP-ID" . 0)
     ("GET-CURRENT-PID-TGID" . 0) ("GET-CURRENT-UID-GID" . 0)

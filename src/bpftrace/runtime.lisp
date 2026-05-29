@@ -1315,6 +1315,16 @@
                                        (let ((cgid (sap-read-u64-le sap off)))
                                          (incf off 8)
                                          (resolve-cgroup-path cgid)))
+                                      ((eq ty :macaddr)
+                                       (prog1
+                                           (format nil "~2,'0X:~2,'0X:~2,'0X:~2,'0X:~2,'0X:~2,'0X"
+                                                   (sb-sys:sap-ref-8 sap (+ off 0))
+                                                   (sb-sys:sap-ref-8 sap (+ off 1))
+                                                   (sb-sys:sap-ref-8 sap (+ off 2))
+                                                   (sb-sys:sap-ref-8 sap (+ off 3))
+                                                   (sb-sys:sap-ref-8 sap (+ off 4))
+                                                   (sb-sys:sap-ref-8 sap (+ off 5)))
+                                         (incf off 6)))
                                       ((eq ty :ipv-any)
                                        ;; Layout: 16 bytes address + 1 byte family.
                                        ;; v4 (family=2) uses the first 4 address

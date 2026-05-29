@@ -838,6 +838,127 @@
                    (whistler:getmap ,*elapsed-map-name* 0)))
     (t       (unsupported "builtin ~A" kw))))
 
+(defun parse-ipv4 (s)
+  "Parse `1.2.3.4' → list of 4 octets, or NIL on bad input."
+  (let ((parts (loop with acc = nil
+                     with cur = ""
+                     for c across s
+                     do (cond
+                          ((char= c #\.)
+                           (push cur acc) (setf cur ""))
+                          (t (setf cur (concatenate 'string cur (string c)))))
+                     finally (push cur acc) (return (nreverse acc)))))
+    (when (= (length parts) 4)
+      (let ((nums (mapcar (lambda (p) (parse-integer p :junk-allowed nil))
+                          parts)))
+        (when (every (lambda (n) (and (integerp n) (<= 0 n 255))) nums)
+          nums)))))
+
+(defun parse-ipv6 (s)
+  "Parse a textual IPv6 address (`::1', `2001:db8::1', …) into 16
+   bytes. Returns NIL on bad input. Compresses one `::' run; raises
+   on malformed double-compress."
+  (let ((dblcol (search "::" s)))
+    (labels ((groups (sub)
+               (when (zerop (length sub)) (return-from groups nil))
+               (let (parts (cur ""))
+                 (loop for c across sub
+                       do (cond
+                            ((char= c #\:)
+                             (push cur parts) (setf cur ""))
+                            (t (setf cur (concatenate 'string cur (string c))))))
+                 (push cur parts)
+                 (mapcar (lambda (g) (parse-integer g :radix 16 :junk-allowed nil))
+                         (nreverse parts)))))
+      (let* ((head (when dblcol (groups (subseq s 0 dblcol))))
+             (tail (when dblcol (groups (subseq s (+ dblcol 2)))))
+             (flat (cond
+                     ((null dblcol) (groups s))
+                     (t (let ((zero-count (- 8 (+ (length head) (length tail)))))
+                          (and (>= zero-count 0)
+                               (append head (make-list zero-count :initial-element 0)
+                                       tail)))))))
+        (when (and flat (= (length flat) 8)
+                   (every (lambda (g) (and (integerp g) (<= 0 g #xffff))) flat))
+          ;; 8 u16 → 16 bytes big-endian.
+          (loop for g in flat
+                append (list (ash g -8) (logand g #xff))))))))
+
+(defun lower-pton (args)
+  "Lower `pton(\"1.2.3.4\")' or `pton(\"::1\")' to a struct-alloc
+   buffer pre-filled with the parsed bytes. Returns a pointer."
+  (unless (and (= (length args) 1)
+               (consp (first args))
+               (eq (first (first args)) :str))
+    (unsupported "pton(): arg must be a string literal"))
+  (let* ((text (second (first args)))
+         (v4   (parse-ipv4 text))
+         (v6   (unless v4 (parse-ipv6 text)))
+         (bytes (or v4 v6))
+         (size  (length bytes))
+         (buf   (gensym "PTON")))
+    (unless bytes
+      (unsupported "pton(): could not parse ~S as IPv4 or IPv6" text))
+    `(let ((,buf (whistler::struct-alloc ,size)))
+       ,@(loop for b in bytes for i from 0
+               collect `(whistler::store whistler::u8 ,buf ,i ,b))
+       ,buf)))
+
+(defun lower-strncmp (args)
+  "Lower `strncmp(s1, s2, n)' to an inline byte-by-byte compare.
+   Returns 0 when the first N bytes of S1 equal S2; non-zero
+   otherwise. Constraints today:
+     * S2 must be a string literal — its bytes are baked in.
+     * N must be a literal integer.
+     * S1 must be `comm', `pcomm', or a $var that's already a
+       string/comm slot pointer (see *str-vars* / *comm-vars*)."
+  (unless (= (length args) 3)
+    (unsupported "strncmp() takes exactly (s1, s2, n)"))
+  (let ((s1 (first args))
+        (s2 (second args))
+        (n  (third args)))
+    (unless (and (consp s2) (eq (first s2) :str))
+      (unsupported "strncmp(): second arg must be a string literal"))
+    (unless (and (consp n) (eq (first n) :int))
+      (unsupported "strncmp(): third arg must be a literal int"))
+    (let* ((literal (second s2))
+           (limit   (second n))
+           (bytes   (sb-ext:string-to-octets literal :external-format :utf-8))
+           (cmp-len (min limit (length bytes)))
+           (acc     (gensym "ACC"))
+           (buf     (gensym "BUF"))
+           (s1-ptr-form
+             (cond
+               ((eq (first s1) :comm)
+                ;; comm needs a fresh copy via get_current_comm; no
+                ;; bare pointer is exposed in expression context.
+                (let ((b (gensym "COMM")))
+                  `(let ((,b (whistler::struct-alloc ,+bt-comm-len+)))
+                     (whistler::get-current-comm ,b ,+bt-comm-len+)
+                     ,b)))
+               ((and (eq (first s1) :var)
+                     (or (member (second s1) *comm-vars* :test #'string-equal)
+                         (assoc (second s1) *str-vars* :test #'string-equal)))
+                (var-sym (second s1)))
+               (t
+                (unsupported
+                 "strncmp(): first arg must be `comm', `pcomm', or a string-typed $var")))))
+      `(let* ((,buf ,s1-ptr-form)
+              (,acc whistler::u64 0))
+         ;; OR-accumulate per-byte XOR: result is 0 iff every byte
+         ;; pair matched. We compare across CMP-LEN bytes; any extra
+         ;; LIMIT > literal length expects S1[i] = 0, which is the
+         ;; convention C strncmp follows after the literal NUL.
+         ,@(loop for i below cmp-len
+                 collect `(whistler:incf ,acc
+                                         (whistler::logxor
+                                          (whistler::load whistler::u8 ,buf ,i)
+                                          ,(aref bytes i))))
+         ,@(loop for i from cmp-len below limit
+                 collect `(whistler:incf ,acc
+                                         (whistler::load whistler::u8 ,buf ,i)))
+         ,acc))))
+
 (defun lower-pcomm-into-record (rec off size)
   "Emit the kernel-side reads that fill REC[OFF..OFF+SIZE) with the
    parent task's `comm' (TASK_COMM_LEN bytes). Walks
@@ -1191,6 +1312,14 @@
       ;; through and tags the key column for userspace rendering.
       ((string= name "signal_name")
        (lower-expr (first (getf (cdr expr) :args))))
+      ;; `kptr(p)' / `uptr(p)' — bpftrace uses these to annotate
+      ;; pointers as kernel- or user-space for its type checker. We
+      ;; don't carry the kind/user-vs-kernel distinction in our type
+      ;; system, so they're identity passes.
+      ((or (string= name "kptr") (string= name "uptr"))
+       (lower-expr (first (getf (cdr expr) :args))))
+      ((string= name "strncmp") (lower-strncmp (getf (cdr expr) :args)))
+      ((string= name "pton")    (lower-pton (getf (cdr expr) :args)))
       ;; User-defined `fn' — inline the body, substituting the
       ;; formal parameters with the actual argument expressions.
       ((find-user-function name)
@@ -1644,6 +1773,12 @@
     ;; for the given id by scanning /sys/fs/cgroup at print time.
     ;; The wire format is just the u64 id; userspace formats.
     ((named-call-p expr "cgroup_path") :cgroup-path)
+    ;; macaddr(ptr) — wire format is 6 raw bytes. Userspace renders
+    ;; them as `xx:xx:xx:xx:xx:xx'.
+    ((named-call-p expr "macaddr") :macaddr)
+    ;; path(struct path *) — uses bpf_d_path to write the path bytes
+    ;; into a NUL-padded buffer; userspace renders the result.
+    ((named-call-p expr "path") (cons :string +bt-str-default-len+))
     ;; buf(ptr, len) — raw byte buffer, capped at +bt-buf-max-len+
     ;; bytes. Wire format is u32 actual-len followed by that many
     ;; bytes (zero-padded to the cap so the record stays a fixed
@@ -1691,6 +1826,7 @@
     ((eq arg-type :ipv6) 16)
     ((eq arg-type :ipv-any) +bt-ntop-slot-size+)
     ((eq arg-type :cgroup-path) 8)
+    ((eq arg-type :macaddr) 6)
     ((eq arg-type :buf) (+ 4 +bt-buf-max-len+))
     ((eq arg-type :strerror) 4)  ; the errno as u32; userspace strerror(3)s it
     ((and (consp arg-type) (eq (car arg-type) :string))   (cdr arg-type))
@@ -1798,6 +1934,11 @@
      ;; scanning /sys/fs/cgroup at decode time.
      (let ((cgid (lower-expr (first (getf (cdr arg) :args)))))
        `(whistler::store ,(intern "U64" :whistler) ,rec ,off ,cgid)))
+    ((eq ty :macaddr)
+     ;; Probe-read 6 bytes from the user-supplied pointer into the
+     ;; record slot; userspace's :macaddr renderer formats them.
+     (let ((ptr (lower-expr (first (getf (cdr arg) :args)))))
+       `(whistler::probe-read-kernel (+ ,rec ,off) 6 ,ptr)))
     ((eq ty :ipv-any)
      ;; ARG is a `\$v' that points at its 17-byte ntop slot. Copy the
      ;; whole slot (16 bytes address + 1 byte family) into the record.
@@ -1823,6 +1964,12 @@
                  (ptr  (lower-expr (first args))))
             `(,(intern "PROBE-READ-KERNEL-STR" :whistler)
               (+ ,rec ,off) ,size ,ptr)))
+         ;; path(struct path *) — bpf_d_path(path, buf, sz) writes
+         ;; the kernel-resolved path NUL-padded into the record slot.
+         ((named-call-p arg "path")
+          (let* ((args (getf (cdr arg) :args))
+                 (ptr  (lower-expr (first args))))
+            `(,(intern "D-PATH" :whistler) ,ptr (+ ,rec ,off) ,size)))
          ;; Literal string — emit byte-stores. Used for probe/func
          ;; rewrites and any printf("…", "literal") form.
          ((eq (first arg) :str)
