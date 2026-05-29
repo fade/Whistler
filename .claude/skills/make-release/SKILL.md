@@ -80,7 +80,10 @@ If the result is not `success`, stop and warn the user that CI is failing on mai
 
 ## 2. Update version
 
-Edit `whistler.asd` and set `:version` to `VERSION`.
+Edit `whistler.asd` and set every `:version "…"` line to `VERSION`.
+There are five — one per `defsystem` (`whistler`, `whistler/loader`,
+`whistler/cli`, `whistler/symbolize`, `whistler/bpftrace`). They must
+stay aligned.
 
 ## 3. Verify all examples compile
 
