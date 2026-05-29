@@ -3381,6 +3381,57 @@
            (cons (fold-getopt (first form)) (fold-getopt (rest form)))
            folded)))))
 
+(defparameter *no-arg-builtin-aliases*
+  ;; bpftrace's stdlib defines `comm()`, `pid()`, etc. as no-arg
+  ;; macros that resolve to the equivalent bare builtin. Map the
+  ;; call form back to the AST node shape that lower-expr expects
+  ;; so downstream paths (printf %s, @m[comm], lower-builtin) all
+  ;; pick them up automatically.
+  '(("comm" :comm)        ("pcomm" :pcomm)
+    ("pid" :builtin :pid) ("tid" :builtin :tid)
+    ("uid" :builtin :uid) ("gid" :builtin :gid)
+    ("ppid" :builtin :ppid)
+    ("nsecs" :builtin :nsecs) ("cpu" :builtin :cpu)
+    ("cgroup" :builtin :cgroup) ("rand" :builtin :rand)
+    ("elapsed" :builtin :elapsed)
+    ("func" :func) ("probe" :probe-name)
+    ("retval" :retval) ("curtask" :curtask)
+    ("args" :args)))
+
+(defun fold-stdlib-aliases-expr (expr)
+  "Rewrite `(:call :name NAME :args ())' to the matching builtin AST
+   node when NAME is one of *no-arg-builtin-aliases*."
+  (cond
+    ((not (and (consp expr) (eq (first expr) :call)
+               (stringp (getf (cdr expr) :name))
+               (null (getf (cdr expr) :args))))
+     expr)
+    (t
+     (let ((mapping (assoc (getf (cdr expr) :name)
+                           *no-arg-builtin-aliases* :test #'string=)))
+       (cond
+         ((null mapping) expr)
+         ;; Two-element mapping → bare-keyword node like `(:comm)'.
+         ((= (length mapping) 2) (list (second mapping)))
+         ;; Three-element mapping → (:builtin :KW) node.
+         (t (list (second mapping) (third mapping))))))))
+
+(defun fold-stdlib-aliases (form)
+  (cond
+    ((not (consp form)) form)
+    (t
+     (let ((folded (fold-stdlib-aliases-expr form)))
+       (if (eq folded form)
+           (cons (fold-stdlib-aliases (first form))
+                 (fold-stdlib-aliases (rest form)))
+           folded)))))
+
+(defun fold-stdlib-aliases-script (script)
+  (cons (first script)
+        (mapcar (lambda (form)
+                  (if (consp form) (fold-stdlib-aliases form) form))
+                (rest script))))
+
 (defun fold-getopt-script (script)
   "Apply fold-getopt to every probe / macro / function body so the
    resolved :str literals reach infer-* and rewrite-self-refs."
@@ -4031,6 +4082,10 @@
          (*cat-paths-table* nil)
          (*map-id-table* nil)
          (*max-scratch-bytes* 0)
+         ;; Fold `comm()' / `pid()' / etc. → bare builtins BEFORE the
+         ;; rest of the pipeline runs, so downstream code only ever
+         ;; sees the canonical AST shape.
+         (script    (fold-stdlib-aliases-script script))
          ;; Resolve getopt(name, string-default) calls against
          ;; *named-params* BEFORE tuple expansion / map inference so
          ;; the resulting :str literals flow through the regular
