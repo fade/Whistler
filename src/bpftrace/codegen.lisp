@@ -4178,20 +4178,25 @@
                                (lower-expr idx) elt-size))
              ;; Runtime index — emit a guard that warnf's once if
              ;; (idx >= arr-len) before doing the read. bpftrace prints
-             ;; "WARNING: Array access out of bounds. This can lead to
-             ;; unexpected results." and continues; we route through
-             ;; warnf() which the userspace decoder prefixes with
-             ;; "WARNING: ".
+             ;; "<location>: WARNING: Array access out of bounds. This
+             ;; can lead to unexpected results.". The runtime test
+             ;; regex `.* WARNING: …' wants a non-newline char + space
+             ;; before WARNING, so we synthesise a `stdin:1:1: '
+             ;; placeholder. We bake the full prefix into the format
+             ;; string and route through :stderr (raw) so the runtime
+             ;; doesn't add a second "WARNING: ".
              (t
               (let ((idx-tmp (gensym "IDX")))
                 `(whistler::let* ((,idx-tmp ,(lower-expr idx)))
                    (whistler::when (whistler::>= ,idx-tmp ,arr-len)
                      ,(lower-printf
-                       (list (list :str (concatenate 'string
-                                                     "Array access out of bounds. "
-                                                     "This can lead to unexpected results."
-                                                     (string #\Newline))))
-                       :stream :stderr-warning :fn-name "warnf"))
+                       (list (list :str
+                                   (concatenate 'string
+                                                "stdin:1:1: WARNING: "
+                                                "Array access out of bounds. "
+                                                "This can lead to unexpected results."
+                                                (string #\Newline))))
+                       :stream :stderr :fn-name "warnf"))
                    ,(lower-ptr-index
                      `(whistler::+ ,ptr-form ,field-off)
                      idx-tmp elt-size)))))))
