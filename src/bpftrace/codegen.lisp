@@ -3815,7 +3815,8 @@
         ;; `@m[k] = (struct A *)e.x'). The map-lookup-ptr returns a
         ;; pointer to the on-map buffer holding the array bytes; load
         ;; the i'th element directly (no probe-read — it's already in
-        ;; kernel memory).
+        ;; kernel memory). Null-guard the pointer so the verifier
+        ;; (and our own bare-deref check) accepts the load.
         ((and (consp base) (eq (first base) :map)
               (let* ((nm   (or (getf (cdr base) :name) "@"))
                      (info (and *map-table* (gethash nm *map-table*))))
@@ -3828,10 +3829,12 @@
                             (1 (intern "U8"  :whistler))
                             (2 (intern "U16" :whistler))
                             (4 (intern "U32" :whistler))
-                            (8 (intern "U64" :whistler)))))
-           `(whistler::load ,type-sym
-                            ,(lower-map-value-ptr base)
-                            (whistler::* ,(lower-expr idx) ,sz))))
+                            (8 (intern "U64" :whistler))))
+                (mp (gensym "MP")))
+           `(whistler:if-let ((,mp ,(lower-map-value-ptr base)))
+              (whistler::load ,type-sym ,mp
+                              (whistler::* ,(lower-expr idx) ,sz))
+              0)))
         ;; `$a.field[i][j]…' — multi-dim index chain on an in-script
         ;; struct array field. Walk the chain, multiply each index
         ;; by the inner-dim stride, then probe-read ELT-SIZE bytes at
@@ -4003,14 +4006,23 @@
    value slot (not the scalar value). Used by lower-index when the
    map's value-array-p is set — `@m[k][i]' needs to subscript the
    on-map buffer directly. NIL on missing lookup is left to BPF-side
-   handling; the caller can wrap in a null check if needed."
+   handling; the caller can wrap in a null check if needed.
+   For scalar-key maps emits `map-lookup' (with-key materialises the
+   key on the stack and the helper returns the value pointer);
+   struct-key maps need `map-lookup-ptr' with an already-pointer key."
   (let* ((info (or (gethash (or (getf (cdr map-expr) :name) "@") *map-table*)
                    (unsupported "unknown map @~A in value-ptr lookup"
                                 (getf (cdr map-expr) :name))))
          (mname (minfo-name info))
-         (keys  (getf (cdr map-expr) :keys)))
+         (keys  (getf (cdr map-expr) :keys))
+         (ptr-p (or (keys-need-ptr-ops-p keys)
+                    (and (minfo-key-size info)
+                         (> (minfo-key-size info) 8)))))
     (with-key keys
-      (lambda (k) `(whistler::map-lookup-ptr ,mname ,k)))))
+      (lambda (k)
+        (if ptr-p
+            `(whistler::map-lookup-ptr ,mname ,k)
+            `(whistler::map-lookup ,mname ,k))))))
 
 ;;; ========== Statement lowering ==========
 
@@ -6287,8 +6299,15 @@
                                        (cdr (assoc as-bt *str-vars*
                                                    :test #'string-equal)))
                    for array-cell = (and as-bt
+                                         ;; bpftrace var names are
+                                         ;; case-preserved but
+                                         ;; collect-vars uppercases
+                                         ;; the gensymed CL symbol;
+                                         ;; compare case-insensitively
+                                         ;; to match the other lookups
+                                         ;; in this loop.
                                          (cdr (assoc as-bt *var-array-types*
-                                                     :test #'string=)))
+                                                     :test #'string-equal)))
                    collect (cond
                              (is-ntop `(,v (whistler::struct-alloc
                                             ,+bt-ntop-slot-size+)))
