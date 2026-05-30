@@ -546,16 +546,33 @@
        (let* ((ident-node (first-tagged inner :ident))
               (name       (text-of ident-node))
               (block-node (first-tagged inner :block))
-              (exprs      (loop for c in (children-of inner)
-                                when (and (consp c)
-                                          (not (member (tag-of c)
-                                                       '(:ident :block))))
-                                  collect c)))
-         (list :for
-               :var name
-               :start (norm-expr-or-expr-wrapped (first exprs))
-               :end   (norm-expr-or-expr-wrapped (second exprs))
-               :body  (norm-block block-node))))
+              (iter-node  (first-tagged inner :for-iter)))
+         (cond
+           ;; `for $kv : @m { … }' — map iteration. The for-iter
+           ;; alternative produced a single :map-access child.
+           ((and iter-node
+                 (let ((kids (children-of iter-node)))
+                   (and kids (= 1 (length kids))
+                        (eq (tag-of (first kids)) :map-access))))
+            ;; Use :over (not :map) for the iterated map AST — the
+            ;; downstream expand-tuple-vars walker matches `:map' as
+            ;; a node tag and would mis-fire on this plist key.
+            (list :for-each
+                  :var name
+                  :over (norm-map-access (first (children-of iter-node)))
+                  :body (norm-block block-node)))
+           ;; Range form `for $i : start..end { … }'.
+           (t
+            (let ((exprs (loop for c in (and iter-node (children-of iter-node))
+                               when (and (consp c)
+                                         (not (member (tag-of c)
+                                                      '(:ident :block))))
+                                 collect c)))
+              (list :for
+                    :var name
+                    :start (norm-expr-or-expr-wrapped (first exprs))
+                    :end   (norm-expr-or-expr-wrapped (second exprs))
+                    :body  (norm-block block-node)))))))
       (:break-stmt    '(:break))
       (:continue-stmt '(:continue))
       (:let-stmt

@@ -80,6 +80,13 @@
                    ;   this map. Triggers emission of a `__len_NAME'
                    ;   sidecar (1-entry percpu-array u64) and the
                    ;   incf/decf injection on update/delete sites.
+  iterated-p       ; T when any `for $kv : @m { … }' iterates this
+                   ;   map. Triggers emission of `__bt_keys_NAME'
+                   ;   (an array of u64 keys), `__bt_count_NAME'
+                   ;   (1-entry array u32 next-index), and
+                   ;   `__bt_seen_NAME' (hash of keys → 1 for dedup)
+                   ;   sidecars, plus the unique-key-append hook on
+                   ;   every `@m[k] = …' insert.
   hist-params)     ; for :lhist, the list (MIN MAX STEP); NIL otherwise.
 
 (defun builtin-size (kw)
@@ -673,6 +680,15 @@
                (:while
                 (mapc #'scan-stmt (getf (cdr stmt) :body)))
                (:for
+                (mapc #'scan-stmt (getf (cdr stmt) :body)))
+               (:for-each
+                ;; Mark the iterated map so gen-defmap emits sidecars
+                ;; and so every `@m[k] = …' insert is hooked to push k
+                ;; onto the key array.
+                (let ((mref (getf (cdr stmt) :over)))
+                  (when (and (consp mref) (eq (first mref) :map))
+                    (setf (minfo-iterated-p (ensure mref)) t)
+                    (note-keys mref)))
                 (mapc #'scan-stmt (getf (cdr stmt) :body))))))
         (dolist (probe (script-probes script))
           (let* ((body (getf (cdr probe) :body))
@@ -1973,6 +1989,30 @@
   "Symbol for the `len(@m)' sidecar counter map. Built off the
    user map's whistler symbol so naming collisions can't happen."
   (intern (concatenate 'string "__LEN_"
+                       (symbol-name (minfo-name info)))
+          :whistler))
+
+(defun iter-keys-sym (info)
+  "Symbol for the `for $kv : @m' sidecar array map holding all keys
+   that have been inserted into @m (uniqued at insert via the seen
+   map). Walked at iteration time by lower-for-each."
+  (intern (concatenate 'string "__BT_KEYS_"
+                       (symbol-name (minfo-name info)))
+          :whistler))
+
+(defun iter-count-sym (info)
+  "Symbol for the 1-entry counter map that records how many distinct
+   keys have been pushed onto iter-keys-sym. Iteration uses this as
+   the upper bound."
+  (intern (concatenate 'string "__BT_COUNT_"
+                       (symbol-name (minfo-name info)))
+          :whistler))
+
+(defun iter-seen-sym (info)
+  "Symbol for the hash sidecar that tracks which keys have already
+   been pushed onto iter-keys-sym — avoids duplicate iteration
+   entries when the same key is written more than once."
+  (intern (concatenate 'string "__BT_SEEN_"
                        (symbol-name (minfo-name info)))
           :whistler))
 
@@ -4037,6 +4077,10 @@
                            (walk (getf (cdr s) :end) skip)
                            (mapc (lambda (x) (walk-stmt x seen skip))
                                  (getf (cdr s) :body)))
+                 (:for-each
+                           (walk (getf (cdr s) :over) skip)
+                           (mapc (lambda (x) (walk-stmt x seen skip))
+                                 (getf (cdr s) :body)))
                  (:assign  (walk (getf (cdr s) :rhs) skip)
                            (let ((lhs (getf (cdr s) :lhs)))
                              (when (eq (first lhs) :var)
@@ -4078,6 +4122,7 @@
     (:if        (lower-if stmt))
     (:while     (lower-while stmt))
     (:for       (lower-for stmt))
+    (:for-each  (lower-for-each stmt))
     (:break     (lower-break stmt))
     (:continue  (lower-continue stmt))
     (:assign    (lower-assign stmt))
@@ -4158,6 +4203,75 @@
                               (,var-sym (whistler::+ ,start-form ,k)))
                (whistler::when (whistler::< ,var-sym ,end-form)
                  ,@body-forms))))))))
+
+(defun lower-for-each (stmt)
+  "Lower a bpftrace `for $kv : @m { body }' over an iterated map.
+   Uses the sidecar __bt_keys_M / __bt_count_M maintained by the
+   insert hook: walk indices 0..count-1, load each key, look it up
+   in @m for the value, bind $kv as a tuple, and run the body.
+   Currently restricted to scalar (≤8-byte) keys and scalar values."
+  (let* ((vname    (getf (cdr stmt) :var))
+         (map-ref  (getf (cdr stmt) :over))
+         (body     (getf (cdr stmt) :body))
+         (info     (or (and *map-table*
+                            (gethash (or (getf (cdr map-ref) :name) "@")
+                                     *map-table*))
+                       (unsupported "for-each: unknown map @~A"
+                                    (getf (cdr map-ref) :name))))
+         (mname    (minfo-name info))
+         (max-ent  (or (minfo-max-entries info) 1024)))
+    (unless (and (minfo-key-size info)
+                 (<= (minfo-key-size info) 8))
+      (unsupported "for $~A : @~A — map iteration currently supports only scalar (≤8-byte) keys"
+                   vname (or (getf (cdr map-ref) :name) "")))
+    ;; Rewrite $kv references in the body so they expand to a tuple of
+    ;; ($kv_k, $kv_v) — gives `print($kv)' the same shape as a literal
+    ;; `(k, v)' tuple, and lets `$kv.0' / `$kv.1' resolve via the
+    ;; existing field-on-tuple path. Outer $kv bindings (if any) get
+    ;; shadowed for the duration of the loop, which matches the
+    ;; loop-scoping bpftrace promises.
+    (let* ((k-name   (concatenate 'string vname "_k"))
+           (v-name   (concatenate 'string vname "_v"))
+           (rewritten (mapcar
+                       (lambda (s)
+                         (let ((*tuple-vars*
+                                 (acons vname
+                                        (list (list :var k-name)
+                                              (list :var v-name))
+                                        *tuple-vars*)))
+                           (expand-tuple-vars s)))
+                       body))
+           (k-sym  (var-sym k-name))
+           (v-sym  (var-sym v-name))
+           (i      (gensym "I"))
+           (cp     (gensym "CP"))
+           (cnt    (gensym "CNT"))
+           (kp     (gensym "KP"))
+           (vp     (gensym "VP"))
+           (bf     (gensym "FOR-BF"))
+           (cf     (gensym "FOR-CF"))
+           (iter-keys  (iter-keys-sym info))
+           (iter-count (iter-count-sym info)))
+      (let* ((*loop-break-bf* bf)
+             (*loop-break-cf* cf)
+             (body-forms (lower-stmts rewritten)))
+        `(whistler::let* ((,bf 0))
+           (whistler::dotimes (,i ,max-ent)
+             (whistler::unless ,bf
+               (whistler:when-let ((,cp (whistler::map-lookup ,iter-count 0)))
+                 (whistler::let* ((,cnt (whistler::load whistler::u32 ,cp 0)))
+                   (whistler::when (whistler::< ,i ,cnt)
+                     (whistler:when-let
+                         ((,kp (whistler::map-lookup ,iter-keys ,i)))
+                       (whistler::let* ((,k-sym (whistler::load whistler::u64
+                                                                ,kp 0)))
+                         (whistler:when-let
+                             ((,vp (whistler::map-lookup ,mname ,k-sym)))
+                           (whistler::let* ((,cf 0)
+                                            (,v-sym
+                                             (whistler::load whistler::u64
+                                                             ,vp 0)))
+                             ,@body-forms))))))))))))))
 
 (defun lower-break (stmt)
   (declare (ignore stmt))
@@ -4551,7 +4665,8 @@
                          (first (getf (cdr rhs) :args))
                          (string= fn "str")))
            (t (gen-scalar-set mname keys (lower-expr rhs) op
-                              :ptr-elt-size (minfo-value-ptr-elt-size info))))))
+                              :ptr-elt-size (minfo-value-ptr-elt-size info)
+                              :info info)))))
       ;; `@m[k] = "literal"' or `= func' (already rewritten to :str).
       ;; The value slot is value-size bytes wide; lay out the literal
       ;; and NUL-pad. Uses map-update-ptr via with-key's struct path
@@ -4573,7 +4688,7 @@
             (minfo-value-strftime-id info))
        (gen-scalar-set mname keys
                        (lower-expr (second (getf (cdr rhs) :args)))
-                       op))
+                       op :info info))
       ;; `@m[k] = (a, b, …)' — tuple value. Allocate a value-sized
       ;; buffer using composite-key-layout's planning, fill each
       ;; slot, then map-update-ptr.
@@ -4622,7 +4737,8 @@
             (minfo-value-ntop-p info))
        (gen-ntop-set info keys (getf (cdr rhs) :args)))
       (t (gen-scalar-set mname keys (lower-expr rhs) op
-                         :ptr-elt-size (minfo-value-ptr-elt-size info)))))))
+                         :ptr-elt-size (minfo-value-ptr-elt-size info)
+                         :info info))))))
 
 (defun gen-str-set (info keys ptr-expr user-p)
   "Store the NUL-terminated string at PTR-EXPR as @MNAME[KEYS]'s
@@ -4892,25 +5008,66 @@
         (whistler::store whistler::u64 ,init 0 1)
         (whistler::store whistler::u64 ,init 8 ,v)))))
 
-(defun gen-scalar-set (mname keys value op &key ptr-elt-size)
+(defun gen-iter-insert-hook (info k-form)
+  "Return a kernel-side form that uniquely appends K-FORM onto the
+   iteration sidecar for the map described by INFO, or NIL when INFO
+   isn't iterated. The hook is a no-op for keys that have already
+   been seen (`__bt_seen_M[k]` was set), so re-assignments don't
+   inflate the key array.
+   NOTE: only emitted when INFO's key-size fits in 8 bytes; struct-
+   key iteration needs ptr-form sidecars and isn't wired up yet."
+  (when (and (minfo-iterated-p info)
+             (minfo-key-size info)
+             (<= (minfo-key-size info) 8))
+    (let ((kvar  (gensym "ITK"))
+          (cp    (gensym "ITCP"))
+          (idx   (gensym "ITIDX"))
+          (keys-map  (iter-keys-sym info))
+          (count-map (iter-count-sym info))
+          (seen-map  (iter-seen-sym info)))
+      `(whistler::let* ((,kvar whistler::u64 ,k-form))
+         (whistler::when (whistler::= (whistler:getmap ,seen-map ,kvar) 0)
+           (setf (whistler:getmap ,seen-map ,kvar) 1)
+           (whistler:when-let ((,cp (whistler::map-lookup ,count-map 0)))
+             (let ((,idx (whistler::load whistler::u32 ,cp 0)))
+               (whistler::when (whistler::< ,idx
+                                            ,(minfo-max-entries info))
+                 (setf (whistler:getmap ,keys-map ,idx) ,kvar)
+                 (whistler::store whistler::u32 ,cp 0
+                                  (whistler::+ ,idx 1))))))))))
+
+(defun maybe-with-iter-hook (info k body)
+  "If INFO is iterated, prepend the sidecar-append hook to BODY so
+   the user's `@m[k] = …' update also pushes K onto __bt_keys_M.
+   Otherwise return BODY unchanged."
+  (let ((hook (and info (gen-iter-insert-hook info k))))
+    (if hook
+        `(whistler::progn ,hook ,body)
+        body)))
+
+(defun gen-scalar-set (mname keys value op &key ptr-elt-size info)
   "Generate a kernel-side update for `@m[k] OP VALUE'. PTR-ELT-SIZE,
    when set, scales the delta for `+=' / `-=' by sizeof(T) — matching
    C/bpftrace pointer arithmetic on typed pointers. Plain `=' is
    never scaled (it writes the raw address). Multiplicative / bitwise
    compound assignments (`*=', `/=', `%=', `|=', `&=', `^=') aren't
    atomic in BPF — generate the standard read-modify-write triple
-   under a map-lookup null guard; matches bpftrace's race-y semantics."
+   under a map-lookup null guard; matches bpftrace's race-y semantics.
+   INFO, when supplied, lets the iteration sidecar hook fire on each
+   insert so `for $kv : @m' iterates exactly the keys the user wrote."
   (let ((delta (if (and ptr-elt-size (or (eq op :+=) (eq op :-=)))
                    `(whistler::* ,value ,ptr-elt-size)
                    value)))
     (with-key keys
       (lambda (k)
-        (case op
-          (:=  `(setf (whistler:getmap ,mname ,k) ,delta))
-          (:+= `(whistler:incf (whistler:getmap ,mname ,k) ,delta))
-          (:-= `(whistler:decf (whistler:getmap ,mname ,k) ,delta))
-          (otherwise
-           (gen-scalar-rmw mname k delta op)))))))
+        (maybe-with-iter-hook
+         info k
+         (case op
+           (:=  `(setf (whistler:getmap ,mname ,k) ,delta))
+           (:+= `(whistler:incf (whistler:getmap ,mname ,k) ,delta))
+           (:-= `(whistler:decf (whistler:getmap ,mname ,k) ,delta))
+           (otherwise
+            (gen-scalar-rmw mname k delta op))))))))
 
 (defun gen-scalar-rmw (mname k delta op)
   "Read-modify-write for compound assignments other than +=/-=.
@@ -5355,7 +5512,8 @@
                  (:if     (mapc #'walk (getf (cdr s) :then))
                           (mapc #'walk (getf (cdr s) :else)))
                  (:while  (mapc #'walk (getf (cdr s) :body)))
-                 (:for    (mapc #'walk (getf (cdr s) :body))))))
+                 (:for    (mapc #'walk (getf (cdr s) :body)))
+                 (:for-each (mapc #'walk (getf (cdr s) :body))))))
       (mapc #'walk stmts))
     acc))
 
@@ -5386,7 +5544,8 @@
                  (:if     (mapc #'walk (getf (cdr s) :then))
                           (mapc #'walk (getf (cdr s) :else)))
                  (:while  (mapc #'walk (getf (cdr s) :body)))
-                 (:for    (mapc #'walk (getf (cdr s) :body))))))
+                 (:for    (mapc #'walk (getf (cdr s) :body)))
+                 (:for-each (mapc #'walk (getf (cdr s) :body))))))
       (mapc #'walk stmts))
     acc))
 
@@ -5414,7 +5573,8 @@
                  (:if     (mapc #'walk (getf (cdr s) :then))
                           (mapc #'walk (getf (cdr s) :else)))
                  (:while  (mapc #'walk (getf (cdr s) :body)))
-                 (:for    (mapc #'walk (getf (cdr s) :body))))))
+                 (:for    (mapc #'walk (getf (cdr s) :body)))
+                 (:for-each (mapc #'walk (getf (cdr s) :body))))))
       (mapc #'walk stmts))
     acc))
 
@@ -5450,7 +5610,8 @@
                  (:if     (mapc #'walk (getf (cdr s) :then))
                           (mapc #'walk (getf (cdr s) :else)))
                  (:while  (mapc #'walk (getf (cdr s) :body)))
-                 (:for    (mapc #'walk (getf (cdr s) :body))))))
+                 (:for    (mapc #'walk (getf (cdr s) :body)))
+                 (:for-each (mapc #'walk (getf (cdr s) :body))))))
       (mapc #'walk stmts))
     acc))
 
@@ -5470,7 +5631,8 @@
                  (:if     (mapc #'walk (getf (cdr s) :then))
                           (mapc #'walk (getf (cdr s) :else)))
                  (:while  (mapc #'walk (getf (cdr s) :body)))
-                 (:for    (mapc #'walk (getf (cdr s) :body))))))
+                 (:for    (mapc #'walk (getf (cdr s) :body)))
+                 (:for-each (mapc #'walk (getf (cdr s) :body))))))
       (mapc #'walk stmts))
     acc))
 
@@ -5861,7 +6023,8 @@
                  (:if     (mapc #'walk (getf (cdr s) :then))
                           (mapc #'walk (getf (cdr s) :else)))
                  (:while  (mapc #'walk (getf (cdr s) :body)))
-                 (:for    (mapc #'walk (getf (cdr s) :body))))))
+                 (:for    (mapc #'walk (getf (cdr s) :body)))
+                 (:for-each (mapc #'walk (getf (cdr s) :body))))))
       (mapc #'walk stmts))
     acc))
 
@@ -5892,7 +6055,8 @@
                  (:if     (mapc #'walk (getf (cdr s) :then))
                           (mapc #'walk (getf (cdr s) :else)))
                  (:while  (mapc #'walk (getf (cdr s) :body)))
-                 (:for    (mapc #'walk (getf (cdr s) :body))))))
+                 (:for    (mapc #'walk (getf (cdr s) :body)))
+                 (:for-each (mapc #'walk (getf (cdr s) :body))))))
       (mapc #'walk stmts))
     acc))
 
@@ -6001,7 +6165,8 @@
                  (:if     (mapc #'walk (getf (cdr s) :then))
                           (mapc #'walk (getf (cdr s) :else)))
                  (:while  (mapc #'walk (getf (cdr s) :body)))
-                 (:for    (mapc #'walk (getf (cdr s) :body))))))
+                 (:for    (mapc #'walk (getf (cdr s) :body)))
+                 (:for-each (mapc #'walk (getf (cdr s) :body))))))
       (mapc #'walk stmts))
     acc))
 
@@ -6049,7 +6214,8 @@
                  (:if     (mapc #'walk (getf (cdr s) :then))
                           (mapc #'walk (getf (cdr s) :else)))
                  (:while  (mapc #'walk (getf (cdr s) :body)))
-                 (:for    (mapc #'walk (getf (cdr s) :body))))))
+                 (:for    (mapc #'walk (getf (cdr s) :body)))
+                 (:for-each (mapc #'walk (getf (cdr s) :body))))))
       (mapc #'walk body))
     m))
 
@@ -6388,6 +6554,37 @@
                               :type :percpu-array
                               :key-size 4 :value-size 8
                               :max-entries 1)))
+         ;; For every @m that `for $kv : @m { … }' iterates, emit a
+         ;; three-map sidecar set: an array of keys, a 1-entry counter
+         ;; for the next-insert index, and a hash for dedup. The key
+         ;; size matches the user map's; the value of __bt_keys is 8
+         ;; bytes for scalar keys (only shape we support for now).
+         (iter-map-forms
+           (loop for info being the hash-values of map-table
+                 when (minfo-iterated-p info)
+                   ;; Restrict to scalar (≤8B) keys for now — composite
+                   ;; / struct keys need pointer-arg map ops that this
+                   ;; first cut doesn't wire up.
+                   when (and (minfo-key-size info)
+                             (<= (minfo-key-size info) 8))
+                     append (list
+                             `(whistler:defmap ,(iter-keys-sym info)
+                                :type :array
+                                :key-size 4
+                                :value-size 8
+                                :max-entries
+                                ,(or (minfo-max-entries info) 1024))
+                             `(whistler:defmap ,(iter-count-sym info)
+                                :type :array
+                                :key-size 4
+                                :value-size 4
+                                :max-entries 1)
+                             `(whistler:defmap ,(iter-seen-sym info)
+                                :type :hash
+                                :key-size 8
+                                :value-size 1
+                                :max-entries
+                                ,(or (minfo-max-entries info) 1024)))))
          (print-map-form
            (when uses-printf
              `(whistler:defmap ,*print-map-name*
@@ -6428,6 +6625,7 @@
                         (when elapsed-map-form (list elapsed-map-form))
                         (when scratch-map-form (list scratch-map-form))
                         len-counter-map-forms
+                        iter-map-forms
                         maps)
           :progs (append tp-preamble probes)
           :user-probes user

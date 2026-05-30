@@ -315,12 +315,13 @@
   unroll-stmt    = <'unroll'> !ident-char <ws> <'('> <ws> expr <ws> <')'> <ws> block
   return-stmt    = <'return'> !ident-char <ws> expr?
   while-stmt     = <'while'> !ident-char <ws> <'('> <ws> expr <ws> <')'> <ws> block
-  (* `for $var : start..end { body }' — range-based for loop. The
-     induction variable is scoped to the body. Both bounds are full
-     expressions; we lower to a bounded dotimes plus a guard. The
-     map iteration form (`for $kv : @m { … }') is not yet supported. *)
+  (* `for $var : start..end { body }' — range-based for loop, or
+     `for $kv : @m { body }' — iterate the keys of a map. Range form
+     lowers to a bounded dotimes plus a guard; map form lowers to a
+     dotimes over a sidecar key-array maintained per-insert. *)
   for-stmt       = <'for'> !ident-char <ws> (<'('> <ws>)? <'$'> ident <ws> <':'> <ws>
-                   expr <ws> <'..'> <ws> expr (<ws> <')'>)? <ws> block
+                   for-iter (<ws> <')'>)? <ws> block
+  for-iter       = expr <ws> <'..'> <ws> expr / map-access
   break-stmt     = <'break'> !ident-char
   continue-stmt  = <'continue'> !ident-char
   (* `let $var;' or `let $var = expr;' — bpftrace's local-var decl.
