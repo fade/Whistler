@@ -4896,16 +4896,42 @@
   "Generate a kernel-side update for `@m[k] OP VALUE'. PTR-ELT-SIZE,
    when set, scales the delta for `+=' / `-=' by sizeof(T) — matching
    C/bpftrace pointer arithmetic on typed pointers. Plain `=' is
-   never scaled (it writes the raw address)."
+   never scaled (it writes the raw address). Multiplicative / bitwise
+   compound assignments (`*=', `/=', `%=', `|=', `&=', `^=') aren't
+   atomic in BPF — generate the standard read-modify-write triple
+   under a map-lookup null guard; matches bpftrace's race-y semantics."
   (let ((delta (if (and ptr-elt-size (or (eq op :+=) (eq op :-=)))
                    `(whistler::* ,value ,ptr-elt-size)
                    value)))
     (with-key keys
       (lambda (k)
-        (ecase op
+        (case op
           (:=  `(setf (whistler:getmap ,mname ,k) ,delta))
           (:+= `(whistler:incf (whistler:getmap ,mname ,k) ,delta))
-          (:-= `(whistler:decf (whistler:getmap ,mname ,k) ,delta)))))))
+          (:-= `(whistler:decf (whistler:getmap ,mname ,k) ,delta))
+          (otherwise
+           (gen-scalar-rmw mname k delta op)))))))
+
+(defun gen-scalar-rmw (mname k delta op)
+  "Read-modify-write for compound assignments other than +=/-=.
+   Loads the current value, applies the binary op against DELTA, and
+   stores the result back through the same map_value pointer."
+  (let* ((wsym  (lambda (s) (intern s :whistler)))
+         (u64   (funcall wsym "U64"))
+         (p     (gensym "P"))
+         (cur   (gensym "CUR"))
+         (sym (case op
+                (:*=  (funcall wsym "*"))
+                (:/=  (funcall wsym "/"))
+                (:%=  (funcall wsym "MOD"))
+                (:&=  (funcall wsym "LOGAND"))
+                (:\|= (funcall wsym "LOGIOR"))
+                (:^=  (funcall wsym "LOGXOR"))
+                (t    (unsupported "compound assignment ~A on @~A"
+                                   op mname)))))
+    `(whistler:when-let ((,p (whistler::map-lookup ,mname ,k)))
+       (let ((,cur (whistler::load ,u64 ,p 0)))
+         (whistler::store ,u64 ,p 0 (,sym ,cur ,delta))))))
 
 (defun gen-hist-update (mname keys value-form &optional info)
   "log2 histogram update. KEYS is the surface key list — empty for
