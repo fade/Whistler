@@ -2800,6 +2800,14 @@
        (lower-printf (list (list :str (concatenate 'string "%s"
                                                    (string #\Newline)))
                            val)))
+      ;; print($v) where $v is strftime-typed → printf("%s\n", $v),
+      ;; the printf-arg-type path picks the :strftime token up from
+      ;; the *strftime-vars* table.
+      ((and (eq tag :var)
+            (assoc (second val) *strftime-vars* :test #'string=))
+       (lower-printf (list (list :str (concatenate 'string "%s"
+                                                   (string #\Newline)))
+                           val)))
       ((eq tag :tuple)
        (multiple-value-bind (fmt-fragment leaves) (tuple-printf-shape val)
          (lower-printf (cons (list :str
