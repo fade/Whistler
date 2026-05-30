@@ -221,6 +221,11 @@
        ((or (str-call-p expr) (kstr-call-p expr)) (str-key-size expr))
        (t 8)))
     (:args   (or (bare-args-byte-width) 8))
+    (:tuple
+     ;; Nested-tuple slot: sum the per-component sizes the same way
+     ;; the outer layout does. Pure u64-per-item except :str leaves.
+     (loop for item in (getf (cdr expr) :items)
+           sum (expr-size item)))
     (:field
      (let ((name (getf (cdr expr) :name)))
        (cond
@@ -303,6 +308,10 @@
                          (minfo-value-size
                           (gethash (or (getf (cdr e) :name) "@")
                                    *map-table*)))
+                        ;; Nested tuple — sum the inner component sizes
+                        ;; so the outer offset advances past the whole
+                        ;; sub-tuple block.
+                        ((eq (first e) :tuple) (expr-size e))
                         (t 8))
            for type = (cond
                         ((eq (first e) :comm) u8)
@@ -3302,6 +3311,22 @@
       ((and (consp base) (eq (first base) :curtask))
        (lower-struct-pointer-field "task_struct" name
                                    '(whistler::get-current-task)))
+      ;; `@m.N' (digit) on a tuple-valued map — load the N'th slot of
+      ;; the map's value. Layout matches composite-key-layout: u64
+      ;; per slot, +bt-func-name-key-len+ for :str entries.
+      ((and (consp base) (eq (first base) :map)
+            (stringp name) (every #'digit-char-p name)
+            *map-table*
+            (let* ((nm (or (getf (cdr base) :name) "@"))
+                   (info (gethash nm *map-table*)))
+              (and info (minfo-value-tuple-p info)
+                   (minfo-value-tuple-types info))))
+       (let* ((nm (or (getf (cdr base) :name) "@"))
+              (info (gethash nm *map-table*))
+              (types (minfo-value-tuple-types info))
+              (idx (parse-integer name))
+              (ty (nth idx types)))
+         (lower-tuple-slot-on-map base info types idx ty)))
       ;; ((struct NAME *)EXPR)->FIELD — when the cast directly wraps a
       ;; plain value (not another field-chain), use the cast type as
       ;; the struct for this single-hop access. A cast wrapping a
@@ -3335,6 +3360,33 @@
             (lower-chained-field (root-ptr-form root) struct-name names))
            (t (field-access-unsupported name)))))
       (t (field-access-unsupported name)))))
+
+(defun lower-tuple-slot-on-map (base info types idx ty)
+  "Load the IDX'th slot of @MAP's tuple value at the offset implied by
+   TYPES (each slot is u64, except :str slots that span
+   +bt-func-name-key-len+ bytes). Returns the raw u64 read; the
+   printf-arg path handles bytes-as-string when the slot type is :str."
+  (declare (ignore info))
+  (let* ((offset (loop for t2 in types
+                       for i from 0
+                       until (= i idx)
+                       sum (if (eq t2 :str) +bt-func-name-key-len+ 8)))
+         (size (if (eq ty :str) +bt-func-name-key-len+ 8))
+         (p   (gensym "TP")))
+    (cond
+      ((eq ty :str)
+       ;; The slot holds NUL-padded bytes; emit a stack-buffer'd copy
+       ;; so the caller can pass it to printf as a string slot.
+       (let ((buf (gensym "STR")))
+         `(whistler:if-let (,p ,(lower-map-value-ptr base))
+            (let ((,buf (whistler::struct-alloc ,size)))
+              (whistler::memcpy ,buf 0 ,p ,offset ,size)
+              ,buf)
+            0)))
+      (t
+       `(whistler:if-let (,p ,(lower-map-value-ptr base))
+          (whistler::load whistler::u64 ,p ,offset)
+          0)))))
 
 (defun field-access-unsupported (name)
   "Signal the generic `field access .NAME on non-args expressions'
@@ -3707,6 +3759,25 @@
    func/probe rewrite) fill the buffer via their helper or via byte
    stores; everything else is a plain typed store."
   (cond
+    ;; Nested tuple — lay each component out contiguously at the
+    ;; outer slot's offset. Sizes mirror composite-key-layout's per-
+    ;; component sizing, so the byte layout matches what the printer
+    ;; reads back via value-tuple-types.
+    ((eq (first expr) :tuple)
+     (let ((items (getf (cdr expr) :items)))
+       (cons 'progn
+             (loop with off = offset
+                   for item in items
+                   for isz = (expr-size item)
+                   for itype = (cond
+                                 ((or (eq (first item) :str)
+                                      (str-call-p item)
+                                      (kstr-call-p item)
+                                      (eq (first item) :comm))
+                                  (intern "U8" :whistler))
+                                 (t (intern "U64" :whistler)))
+                   collect (store-key-component buf off itype item)
+                   do (incf off isz)))))
     ((eq (first expr) :comm)
      `(whistler::get-current-comm (+ ,buf ,offset) ,+bt-comm-len+))
     ((or (str-call-p expr) (kstr-call-p expr))
