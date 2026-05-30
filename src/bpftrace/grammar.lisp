@@ -354,8 +354,13 @@
   arrow-access   = <'->'> ident
   index-access   = <'['> <ws> expr (<ws> <','> <ws> expr)* <ws> <']'>
 
-  primary        = cast / primitive-pointer-cast / primitive-cast / block-expr / offsetof-expr / sizeof-expr / tuple / parens / func-call / map-access / scalar-var / builtin /
+  primary        = cast / enum-cast / primitive-pointer-cast / primitive-cast / block-expr / offsetof-expr / sizeof-expr / tuple / parens / func-call / map-access / scalar-var / builtin /
                    duration-literal / constant / string-lit / hex-int / integer
+  (* `(enum NAME)EXPR' — cast that turns an integer into its enum
+     member name at print time. Compile-time folded when EXPR is a
+     literal and the value matches a member; otherwise emits a u64
+     payload + enum-id so the userspace decoder can look up. *)
+  enum-cast      = <'('> <ws> <'enum'> <ws> ident <ws> <')'> <ws> postfix
   (* bpftrace duration literals: `100ms', `1s', `5us', `1ns'.
      Convert to nanoseconds at parse time (`100ms' → 100_000_000).
      Must precede `constant' so `ms' / `us' / `s' / `ns' don't get

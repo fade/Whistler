@@ -1337,6 +1337,20 @@
                                          (if fstr
                                              (strftime-light fstr ts)
                                              "?")))
+                                      ((and (consp ty) (eq (car ty) :enum))
+                                       ;; Reverse-lookup the value in
+                                       ;; *script-enum-values* to find
+                                       ;; the matching member name.
+                                       ;; Falls back to the decimal
+                                       ;; value if no member matches.
+                                       (let* ((v (sap-read-u64-le sap off))
+                                              (pair (rassoc v
+                                                            (or *enum-values* nil)
+                                                            :test #'=)))
+                                         (incf off 8)
+                                         (if pair
+                                             (car pair)
+                                             (format nil "~D" v))))
                                       ((eq ty :int)
                                        (prog1 (sap-read-u64-le sap off)
                                          (incf off 8)))
@@ -1742,6 +1756,7 @@
            ;; resolve after they exit.
            (symbolizer (whistler/symbolize:open-symbolizer))
            (printf-table (getf gen :printf-table))
+           (*enum-values* (getf gen :enum-values))
            (time-format-table (getf gen :time-format-table))
            (cat-paths-table (getf gen :cat-paths-table))
            (system-cmds-table (getf gen :system-cmds-table))

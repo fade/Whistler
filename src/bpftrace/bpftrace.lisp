@@ -45,6 +45,12 @@
   "When T (set by `-q'), suppress the probe-attach header and other
    chatter. Map dumps and printf output still flow.")
 
+(defvar *enum-values* nil
+  "Alist of (MEMBER-NAME . VALUE) for all enum members declared in
+   the active script. Populated from the generate() plist before the
+   printf decoder runs; the (enum NAME)X cast decoder rassoc's the
+   integer value back to a member name.")
+
 (defvar *child-cpid* nil
   "When `whistler bpftrace -c CMD' spawned a child, the CLI sets
    this to the child's pid before compile-script runs. The codegen

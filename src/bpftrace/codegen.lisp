@@ -886,6 +886,10 @@
     ;; so we just lower the inner expression. Width-aware ops like
     ;; bswap peek at this node before reaching here.
     (:int-cast      (lower-expr (getf (cdr expr) :expr)))
+    ;; `(enum NAME)EXPR' — value cast. The printf-arg-type path
+    ;; recognises the wrapper and emits an :enum slot; in a non-
+    ;; printf position we just lower the underlying value.
+    (:enum-cast     (lower-expr (getf (cdr expr) :expr)))
     ;; Positional CLI parameter — `$1', `$2', …. Resolved from
     ;; *positional-args* at compile time. Numeric tokens lower to
     ;; their integer value; non-numeric tokens become 0 (matching
@@ -2643,6 +2647,12 @@
     ;; size). printf's %r format renders the bytes as an escaped
     ;; string in userspace.
     ((named-call-p expr "buf") :buf)
+    ;; `(enum NAME)EXPR' as a printf arg — slot type carries the
+    ;; enum name so the userspace decoder can map the u64 value
+    ;; back to a member name. Compile-time fold when EXPR is a
+    ;; literal we can resolve right now.
+    ((and (consp expr) (eq (first expr) :enum-cast))
+     (cons :enum (getf (cdr expr) :name)))
     ((named-call-p expr "strftime")
      ;; Register the format string and emit a (:strftime . ID) slot.
      ;; The wire format is just the u64 timestamp; the runtime looks
@@ -2689,6 +2699,7 @@
     ((eq arg-type :strerror) 4)  ; the errno as u32; userspace strerror(3)s it
     ((and (consp arg-type) (eq (car arg-type) :string))   (cdr arg-type))
     ((and (consp arg-type) (eq (car arg-type) :strftime)) 8)  ; just the u64 timestamp
+    ((and (consp arg-type) (eq (car arg-type) :enum))     8)  ; u64; userspace resolves name
     (t (error "printf-arg-size: unrecognised ~A" arg-type))))
 
 (defun lower-print-value (args)
@@ -2803,6 +2814,13 @@
   (cond
     ((eq ty :int)
      `(whistler::store ,(intern "U64" :whistler) ,rec ,off ,(lower-expr arg)))
+    ;; `(enum NAME)EXPR' — the wire format is the same u64 as :int;
+    ;; the per-arg :enum type token carries the enum NAME so
+    ;; userspace can render `1' → `"ONE"' from the script's enum
+    ;; member table.
+    ((and (consp ty) (eq (car ty) :enum))
+     `(whistler::store ,(intern "U64" :whistler) ,rec ,off
+                       ,(lower-expr (getf (cdr arg) :expr))))
     ((eq ty :ksym)
      ;; Just stash the raw u64 address. Userspace will run it through
      ;; /proc/kallsyms at decode time.
@@ -6023,6 +6041,7 @@
           :elapsed-map (when uses-elapsed *elapsed-map-name*)
           :stack-depth +bt-stack-depth+
           :printf-table (reverse *printf-table*)
+          :enum-values *script-enum-values*
           :time-format-table (reverse *time-format-table*)
           :cat-paths-table (reverse *cat-paths-table*)
           :system-cmds-table (reverse *system-cmds-table*)

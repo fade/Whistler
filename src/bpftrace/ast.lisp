@@ -755,6 +755,16 @@
                                     (not (eq (tag-of c) :int-type-name))))
                              (children-of inner))))
          (list :int-cast :type type :expr (norm-expr-dispatch sub))))
+      (:enum-cast
+       ;; `(enum NAME)EXPR' — preserved as an :enum-cast so the
+       ;; printf-arg-type path can emit an :enum-typed slot. lower-
+       ;; expr just lowers the inner expression (value flows as u64).
+       (let* ((name (text-of (first-tagged inner :ident)))
+              (sub  (find-if (lambda (c)
+                               (and (consp c)
+                                    (not (eq (tag-of c) :ident))))
+                             (children-of inner))))
+         (list :enum-cast :name name :expr (norm-expr-dispatch sub))))
       (:primitive-pointer-cast
        ;; (int32 *)x — the element type IS load-bearing: codegen needs
        ;; it to size `$v[i]' reads. We preserve it as :prim-ptr-cast
