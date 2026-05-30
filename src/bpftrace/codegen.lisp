@@ -283,6 +283,19 @@
                          (* (second af-meta) (fourth af-meta)))
                         ;; Bare `args' under fentry/fexit: param-count × 8.
                         ((and (eq (first e) :args) (bare-args-byte-width)))
+                        ;; `@m[@other]' where @other's value is an
+                        ;; in-script array — slot is exactly @other's
+                        ;; value-size bytes (we memcpy them in).
+                        ((and (eq (first e) :map)
+                              *map-table*
+                              (let ((src (gethash (or (getf (cdr e) :name)
+                                                      "@")
+                                                  *map-table*)))
+                                (and src (minfo-value-array-p src)
+                                     (minfo-value-size src))))
+                         (minfo-value-size
+                          (gethash (or (getf (cdr e) :name) "@")
+                                   *map-table*)))
                         (t 8))
            for type = (cond
                         ((eq (first e) :comm) u8)
@@ -292,6 +305,13 @@
                         ((or (str-call-p e) (kstr-call-p e)) u8)
                         ((and af-meta (first af-meta)) u8)
                         ((and (eq (first e) :args) (bare-args-byte-width)) u8)
+                        ((and (eq (first e) :map)
+                              *map-table*
+                              (let ((src (gethash (or (getf (cdr e) :name)
+                                                      "@")
+                                                  *map-table*)))
+                                (and src (minfo-value-array-p src))))
+                         u8)
                         (t u64))
            collect (list offset size type e)
            do (incf offset size))
@@ -311,13 +331,25 @@
                     ((named-call-p expr "syscall_name") :syscall-name)
                     ((named-call-p expr "signal_name")  :signal-name)
                     (t nil)))
+    ;; In-script struct array field `((struct T *)e).x' where x is
+    ;; declared as an array — carry the shape so the printer can
+    ;; render this composite-key slot as `[v1,v2,…]'.
+    (:field   (multiple-value-bind (_b sz _o len) (array-field-meta expr)
+                (declare (ignore _b _o))
+                (when (and sz len)
+                  (list :array sz len))))
     (t        nil)))
 
 (declaim (special *probe-spec*))
 
 (defun infer-maps (script)
   "Return a hash table RAW-NAME (or \"@\") → MINFO."
-  (let ((table (make-hash-table :test 'equal)))
+  (let* ((table (make-hash-table :test 'equal))
+         ;; Bind *map-table* during the walk so helpers called from
+         ;; note-keys (composite-key-layout in particular) can look up
+         ;; previously-seen maps to derive cross-map shape — e.g. the
+         ;; key-size of `@x[@a]' is exactly @a's value-size.
+         (*map-table* table))
     (labels ((ensure (mref)
                (let* ((raw (getf (cdr mref) :name))
                       (key (or raw "@")))
@@ -366,6 +398,28 @@
                        (when (and sz len)
                          (setf (minfo-key-array-elt-size info) sz
                                (minfo-key-array-len info) len))))
+                   ;; Single-key that's `@other-map' — the lookup
+                   ;; returns whatever the other map stored. If that
+                   ;; was an in-script array (e.g.
+                   ;; `@a = ((struct A *)e).x; @x[@a] = …'), the key
+                   ;; here IS those bytes — sized and rendered the
+                   ;; same way.
+                   (when (and (= (length keys) 1)
+                              (consp (first keys))
+                              (eq (first (first keys)) :map))
+                     (let* ((src-raw (getf (cdr (first keys)) :name))
+                            (src-info (gethash (or src-raw "@") table)))
+                       (when (and src-info
+                                  (minfo-value-array-p src-info)
+                                  (minfo-value-array-elt-size src-info)
+                                  (plusp (minfo-value-array-elt-size src-info)))
+                         (let* ((sz (minfo-value-array-elt-size src-info))
+                                (vs (minfo-value-size src-info))
+                                (len (floor vs sz)))
+                           (setf (minfo-key-array-elt-size info) sz
+                                 (minfo-key-array-len info) len
+                                 (minfo-key-size info)
+                                 (max (minfo-key-size info) vs))))))
                    ;; Single-key strftime(): `@[strftime("FMT", TS)] = …'
                    ;; — register the format and stash the id on the
                    ;; map so the userspace key formatter strftime's
@@ -3556,6 +3610,27 @@
            (width (bare-args-byte-width)))
        `(let ((,tmp ,(lower-bare-args)))
           (whistler::memcpy ,buf ,offset ,tmp 0 ,width))))
+    ;; `@m[@other]' where @other's value is an in-script array.
+    ;; A bare map-lookup returns the value pointer (for both scalar
+    ;; and struct keys; whistler's map-lookup auto-dispatches to the
+    ;; right helper). Null-guard the lookup and memcpy the bytes into
+    ;; the key slot.
+    ((and (eq (first expr) :map)
+          *map-table*
+          (let ((src (gethash (or (getf (cdr expr) :name) "@")
+                              *map-table*)))
+            (and src (minfo-value-array-p src)
+                 (minfo-value-array-elt-size src)
+                 (plusp (minfo-value-array-elt-size src)))))
+     (let* ((src   (gethash (or (getf (cdr expr) :name) "@") *map-table*))
+            (width (minfo-value-size src))
+            (mname (minfo-name src))
+            (keys  (getf (cdr expr) :keys))
+            (ptr   (gensym "MP")))
+       (with-key keys
+         (lambda (k)
+           `(whistler:when-let ((,ptr (whistler::map-lookup ,mname ,k)))
+              (whistler::memcpy ,buf ,offset ,ptr 0 ,width))))))
     (t `(whistler::store ,type ,buf ,offset ,(lower-expr expr)))))
 
 (defun with-key (keys body-fn)
@@ -4713,7 +4788,8 @@
    produces for `@[func]' / `@[probe]' inside map keys, so the
    downstream path needs to recognise it the same way), or by a
    single in-script struct array-field key (its byte width exceeds
-   the 8-byte scalar key path)."
+   the 8-byte scalar key path), or by `@m[@other]' where @other's
+   value is a >8-byte array we need to pass by pointer."
   (or (> (length keys) 1)
       (and (= (length keys) 1)
            (let ((k (first keys)))
@@ -4724,7 +4800,18 @@
                  (str-call-p k)
                  (kstr-call-p k)
                  (and (eq (first k) :field) (array-field-meta k))
-                 (and (eq (first k) :args) (bare-args-byte-width)))))))
+                 (and (eq (first k) :args) (bare-args-byte-width))
+                 ;; `@m[@other]' where @other's value is an in-script
+                 ;; array — the lookup returns a pointer to the bytes,
+                 ;; and @m's key is exactly those bytes.
+                 (and (eq (first k) :map)
+                      *map-table*
+                      (let ((src (gethash (or (getf (cdr k) :name) "@")
+                                          *map-table*)))
+                        (and src
+                             (minfo-value-array-p src)
+                             (minfo-value-array-elt-size src)
+                             (plusp (minfo-value-array-elt-size src))))))))))
 
 (defun gen-percpu-struct-update (mname keys value-form &key on-existing on-init)
   "Common scaffolding for sum/avg/min/max — all of which use a percpu
@@ -6343,6 +6430,15 @@
                                                    1)
                                     :key-array-elt-size (minfo-key-array-elt-size info)
                                     :key-array-len (minfo-key-array-len info)
+                                    :value-array-elt-size
+                                    (and (minfo-value-array-p info)
+                                         (minfo-value-array-elt-size info))
+                                    :value-array-len
+                                    (and (minfo-value-array-p info)
+                                         (minfo-value-array-elt-size info)
+                                         (plusp (minfo-value-array-elt-size info))
+                                         (/ (minfo-value-size info)
+                                            (minfo-value-array-elt-size info)))
                                     :keyed-p (minfo-keyed-p info)
                                     :value-tuple-p (minfo-value-tuple-p info)
                                     :value-tuple-types (minfo-value-tuple-types info)

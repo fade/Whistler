@@ -531,6 +531,7 @@
 
 (defun format-key (key &key (parts 1) key-builtin
                             array-elt-size array-len
+                            key-types
                             json-p)
   "Render KEY (an integer) as bpftrace does. JSON-P switches the
    composite-slot separator from `, ' to `,' to match bpftrace's
@@ -542,6 +543,9 @@
    * ARRAY-ELT-SIZE + ARRAY-LEN — KEY is the bytes of an in-script
      struct array field. Render as `[v1,v2,…]' matching bpftrace's
      array-key format.
+   * KEY-TYPES — composite key with per-slot widths. Each entry is
+     either NIL (a plain 8-byte slot, signed-decimal render) or
+     `(:array ELT-SIZE LEN)' for an inline array field.
    * scalar (PARTS=1): bare decimal.
    * composite (PARTS>1): split into 8-byte chunks and render."
   (cond
@@ -562,6 +566,39 @@
                   (format s "~D" v)))
        (write-char #\] s)))
     ((<= parts 1) (format nil "~D" (signed-64 key)))
+    ((and key-types (some (lambda (ty) (and (consp ty) (eq (car ty) :array)))
+                          key-types))
+     ;; Composite key with at least one array slot: walk per-slot with
+     ;; explicit bit offsets so a wider-than-8-byte array slot doesn't
+     ;; mis-shift the following slots.
+     (with-output-to-string (s)
+       (let ((bit-off 0))
+         (loop for ty in key-types
+               for i from 0
+               do (when (plusp i)
+                    (write-string (if json-p "," ", ") s))
+                  (cond
+                    ((and (consp ty) (eq (car ty) :array))
+                     (let* ((elt-size (second ty))
+                            (arr-len  (third ty))
+                            (elt-bits (* elt-size 8))
+                            (mask     (1- (ash 1 elt-bits))))
+                       (write-char #\[ s)
+                       (loop for j below arr-len
+                             for v = (logand (ash key (- (+ bit-off
+                                                            (* j elt-bits))))
+                                             mask)
+                             do (when (plusp j)
+                                  (write-string (if json-p "," ",") s))
+                                (format s "~D" v))
+                       (write-char #\] s)
+                       (incf bit-off (* elt-bits arr-len))))
+                    (t
+                     (format s "~D"
+                             (signed-64
+                              (logand (ash key (- bit-off))
+                                      #xffffffffffffffff)))
+                     (incf bit-off 64)))))))
     (t
      (with-output-to-string (s)
        (loop for i below parts
@@ -809,6 +846,7 @@
                                           (kind :counter) key-builtin
                                           key-types
                                           key-array-elt-size key-array-len
+                                          value-array-elt-size value-array-len
                                           value-tuple-p value-tuple-types
                                           value-strftime-id key-strftime-id
                                           time-format-table
@@ -908,6 +946,7 @@
                                         :key-builtin key-builtin
                                         :array-elt-size key-array-elt-size
                                         :array-len key-array-len
+                                        :key-types key-types
                                         :json-p t)
                             (json-format-scalar-value (cdr kv))))
                   pairs)))
@@ -931,7 +970,8 @@
                                     :parts key-parts
                                     :key-builtin key-builtin
                                     :array-elt-size key-array-elt-size
-                                    :array-len key-array-len)))
+                                    :array-len key-array-len
+                                    :key-types key-types)))
                    (cond
                      (value-strftime-id
                       (strftime-light
@@ -939,7 +979,9 @@
                                        :test #'=))
                            "?")
                        (cdr kv)))
-                     (t (format-scalar-value (cdr kv)))))))
+                     (t (format-scalar-value (cdr kv)
+                                              :array-elt-size value-array-elt-size
+                                              :array-len value-array-len))))))
         (t
          (dolist (kv pairs)
            (format t "~A: ~A~%"
@@ -951,7 +993,9 @@
                                        :test #'=))
                            "?")
                        (cdr kv)))
-                     (t (format-scalar-value (cdr kv)))))))))))
+                     (t (format-scalar-value (cdr kv)
+                                              :array-elt-size value-array-elt-size
+                                              :array-len value-array-len))))))))))
 
 (defun json-format-scalar-value (v)
   "JSON-encode a scalar map value cell. Integers go bare; strings
@@ -965,12 +1009,14 @@
     ((stringp v) (format nil "~S" v))
     (t (format nil "~D" v))))
 
-(defun format-scalar-value (v)
+(defun format-scalar-value (v &key array-elt-size array-len)
   "Render a scalar map's value cell. Most values are integers; stats()
    threads a (:stats COUNT SUM) sentinel that pretty-prints as
    `count NN, average AA, total TT`, mirroring bpftrace. A plain
    list (no leading keyword) is a tuple value (`@m = (a, b)') which
-   renders as `(a, b)'."
+   renders as `(a, b)'. ARRAY-ELT-SIZE + ARRAY-LEN render the value's
+   little-endian bytes as `[v1,v2,…]' — used when the map's value
+   slot holds an in-script struct array field."
   (cond
     ((and (consp v) (eq (first v) :stats))
      (let ((c (second v))
@@ -979,6 +1025,16 @@
                c (if (zerop c) 0 (floor s c)) s)))
     ((and (consp v) (not (keywordp (first v))))
      (format-tuple-value v))
+    ((and array-elt-size array-len)
+     (with-output-to-string (s)
+       (write-char #\[ s)
+       (let ((bits (* array-elt-size 8))
+             (mask (1- (ash 1 (* array-elt-size 8)))))
+         (loop for i below array-len
+               for cell = (logand (ash v (- (* i bits))) mask)
+               do (when (plusp i) (write-char #\, s))
+                  (format s "~D" cell)))
+       (write-char #\] s)))
     (t (format nil "~D" (signed-64 v)))))
 
 (defun print-all-maps (info-list map-alist &key stacks-info stack-depth
@@ -1010,6 +1066,10 @@
                                    (getf (cdr info-rec) :key-array-elt-size)
                                    :key-array-len
                                    (getf (cdr info-rec) :key-array-len)
+                                   :value-array-elt-size
+                                   (getf (cdr info-rec) :value-array-elt-size)
+                                   :value-array-len
+                                   (getf (cdr info-rec) :value-array-len)
                                    :value-tuple-p
                                    (getf (cdr info-rec) :value-tuple-p)
                                    :value-tuple-types
@@ -1617,6 +1677,14 @@
                   :keyed-p   (getf (cdr info-rec) :keyed-p)
                   :key-builtin (getf (cdr info-rec) :key-builtin)
                   :key-types (getf (cdr info-rec) :key-types)
+                  :key-array-elt-size
+                  (getf (cdr info-rec) :key-array-elt-size)
+                  :key-array-len
+                  (getf (cdr info-rec) :key-array-len)
+                  :value-array-elt-size
+                  (getf (cdr info-rec) :value-array-elt-size)
+                  :value-array-len
+                  (getf (cdr info-rec) :value-array-len)
                   :kind      (getf (cdr info-rec) :kind)
                   :top       (when (plusp top) top)
                   :div       (when (plusp div) div)
