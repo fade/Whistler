@@ -667,8 +667,14 @@
               (then-env (mapcar (lambda (e) (list (car e) (cadr e) (cddr e)))
                                 (lower-ctx-env ctx))))
 
-          ;; Restore env to pre-branch state for else
-          (dolist (pre pre-env)
+          ;; Restore env to pre-branch state for else. Iterate pre-env in
+          ;; REVERSE so when the same name appears multiple times (a let*
+          ;; shadowing an outer binding), the inner-most pre-entry is
+          ;; restored LAST — assoc always returns the first matching cell,
+          ;; so the final write determines its value. Without the reverse
+          ;; pass, an outer pre-entry overwrites the inner cell with the
+          ;; outer's vreg, mis-binding the variable for the else-branch.
+          (dolist (pre (reverse pre-env))
             (let ((entry (assoc (first pre) (lower-ctx-env ctx)
                                 :test (lambda (a b)
                                         (string= (symbol-name a)

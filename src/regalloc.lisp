@@ -80,11 +80,13 @@
         (first-stack-addr (make-hash-table))  ; vreg → first stack-addr use position
         (has-non-stack-use (make-hash-table)) ; vreg → t if used outside stack-addr
         (def-insn (make-hash-table))   ; vreg → defining instruction
+        (block-start-pos (make-hash-table)) ; label → first insn position in block
         (block-end-pos (make-hash-table)) ; label → last insn position in block
         (pos 0))
 
     ;; Walk all instructions in block order, assigning positions
     (dolist (block (ir-program-blocks prog))
+      (setf (gethash (basic-block-label block) block-start-pos) pos)
       (dolist (insn (basic-block-insns block))
         ;; Record definitions
         (when (ir-insn-dst insn)
@@ -135,6 +137,40 @@
                   (setf (gethash vreg last-use)
                         (max (or (gethash vreg last-use) pred-end)
                              pred-end)))))))))
+
+    ;; Extend liveness across loop back-edges. A vreg defined outside a loop
+    ;; but used inside it must stay live through the entire loop body so that
+    ;; subsequent iterations still see its value. Without this, a vreg whose
+    ;; positional last-use sits at the loop's first ALU consumer would be
+    ;; expired immediately, and the register-allocator would happily reuse
+    ;; its physical register for the result — clobbering the loop-invariant
+    ;; value on every iteration.
+    (let ((back-edges '()))   ; list of (source-end-pos . target-start-pos)
+      (dolist (block (ir-program-blocks prog))
+        (let ((src-label (basic-block-label block)))
+          (dolist (succ-label (basic-block-succs block))
+            (let ((tgt-start (gethash succ-label block-start-pos))
+                  (src-end   (gethash src-label   block-end-pos)))
+              (when (and tgt-start src-end (<= tgt-start src-end))
+                (push (cons src-end tgt-start) back-edges))))))
+      (when back-edges
+        (let ((extended last-use))
+          (maphash
+           (lambda (vreg use-pos)
+             (let ((def (gethash vreg def-pos)))
+               (when def
+                 (dolist (be back-edges)
+                   (let ((src-end (car be))
+                         (tgt-start (cdr be)))
+                     ;; vreg used inside loop [tgt-start, src-end] AND defined
+                     ;; before the loop header → keep it live through src-end
+                     ;; so the back-edge's iteration still sees it.
+                     (when (and (>= use-pos tgt-start)
+                                (<= use-pos src-end)
+                                (< def tgt-start)
+                                (> src-end use-pos))
+                       (setf (gethash vreg extended) src-end)))))))
+           last-use))))
 
     ;; Build intervals with value classification
     (let ((intervals '()))
