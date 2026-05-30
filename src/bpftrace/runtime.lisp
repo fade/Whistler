@@ -411,6 +411,46 @@
   (let ((bytes (whistler/loader::map-lookup-int info key)))
     (or bytes 0)))
 
+(defun lookup-tuple-value (info key tuple-types)
+  "Read the tuple-packed value at KEY and return a list — one entry
+   per slot, decoded by TUPLE-TYPES. Layout matches what
+   composite-key-layout wrote: each slot is u64 unless TUPLE-TYPES
+   marks it as `:str' (a `+bt-func-name-key-len+'-byte NUL-padded
+   string)."
+  (let* ((kbytes (whistler/loader::encode-int-key
+                  key (whistler/loader::map-info-key-size info)))
+         (raw (whistler/loader::map-lookup info kbytes)))
+    (unless raw (return-from lookup-tuple-value nil))
+    (loop with off = 0
+          for ty in tuple-types
+          collect (cond
+                    ((eq ty :str)
+                     (let* ((cap +bt-func-name-key-len+)
+                            (s (with-output-to-string (s)
+                                 (loop for i below cap
+                                       for b = (aref raw (+ off i))
+                                       while (plusp b)
+                                       do (write-char (code-char b) s)))))
+                       (incf off cap)
+                       s))
+                    (t
+                     (let ((v (loop for i below 8
+                                    sum (ash (aref raw (+ off i))
+                                             (* i 8)))))
+                       (incf off 8)
+                       v))))))
+
+(defun format-tuple-value (slots)
+  "Render a tuple-value list as `(v1, v2, …)' — strings unquoted to
+   match bpftrace's display."
+  (with-output-to-string (s)
+    (write-char #\( s)
+    (loop for (v . rest) on slots
+          do (cond ((stringp v) (write-string v s))
+                   (t (format s "~D" v)))
+             (when rest (write-string ", " s)))
+    (write-char #\) s)))
+
 (defun lookup-percpu-sum (info key)
   "For a percpu map, sum the per-CPU values at KEY (treated as u64)."
   (let* ((kbytes (whistler/loader::encode-int-key
@@ -768,6 +808,7 @@
                                           (kind :counter) key-builtin
                                           key-types
                                           key-array-elt-size key-array-len
+                                          value-tuple-p value-tuple-types
                                           top div
                                           stacks-info stack-depth
                                           symbolizer)
@@ -781,20 +822,24 @@
   (let* ((keys (map-keys info))
          (pairs (sort (mapcar
                        (lambda (k)
-                         (cons k (case kind
-                                   (:sum (reduce-sum info k))
-                                   (:avg (multiple-value-bind (c s)
-                                             (reduce-avg info k)
-                                           (if (zerop c) 0 (floor s c))))
-                                   ;; stats() pre-computes a tagged
-                                   ;; sentinel that the line formatter
-                                   ;; pretty-prints below.
-                                   (:stats (multiple-value-bind (c s)
-                                               (reduce-avg info k)
-                                             (list :stats c s)))
-                                   ((:min) (reduce-min/max info k :min))
-                                   ((:max) (reduce-min/max info k :max))
-                                   (t     (lookup-int info k)))))
+                         (cons k (cond
+                                   ((and value-tuple-p value-tuple-types)
+                                    (lookup-tuple-value info k value-tuple-types))
+                                   (t (case kind
+                                        (:sum (reduce-sum info k))
+                                        (:avg (multiple-value-bind (c s)
+                                                  (reduce-avg info k)
+                                                (if (zerop c) 0 (floor s c))))
+                                        ;; stats() pre-computes a
+                                        ;; tagged sentinel that the
+                                        ;; line formatter pretty-prints
+                                        ;; below.
+                                        (:stats (multiple-value-bind (c s)
+                                                    (reduce-avg info k)
+                                                  (list :stats c s)))
+                                        ((:min) (reduce-min/max info k :min))
+                                        ((:max) (reduce-min/max info k :max))
+                                        (t     (lookup-int info k)))))))
                        keys)
                       #'<
                       :key (lambda (kv)
@@ -897,13 +942,17 @@
 (defun format-scalar-value (v)
   "Render a scalar map's value cell. Most values are integers; stats()
    threads a (:stats COUNT SUM) sentinel that pretty-prints as
-   `count NN, average AA, total TT`, mirroring bpftrace."
+   `count NN, average AA, total TT`, mirroring bpftrace. A plain
+   list (no leading keyword) is a tuple value (`@m = (a, b)') which
+   renders as `(a, b)'."
   (cond
     ((and (consp v) (eq (first v) :stats))
      (let ((c (second v))
            (s (third v)))
        (format nil "count ~D, average ~D, total ~D"
                c (if (zerop c) 0 (floor s c)) s)))
+    ((and (consp v) (not (keywordp (first v))))
+     (format-tuple-value v))
     (t (format nil "~D" v))))
 
 (defun print-all-maps (info-list map-alist &key stacks-info stack-depth
@@ -934,6 +983,10 @@
                                    (getf (cdr info-rec) :key-array-elt-size)
                                    :key-array-len
                                    (getf (cdr info-rec) :key-array-len)
+                                   :value-tuple-p
+                                   (getf (cdr info-rec) :value-tuple-p)
+                                   :value-tuple-types
+                                   (getf (cdr info-rec) :value-tuple-types)
                                    :kind kind
                                    :stacks-info stacks-info
                                    :stack-depth stack-depth

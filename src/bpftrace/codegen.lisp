@@ -63,6 +63,14 @@
                    ;   uses this with key-array-len to render keys as
                    ;   `[v1,v2,…]' matching bpftrace's array-key style.
   key-array-len    ; Number of elements in the array key when set.
+  value-tuple-p    ; T when the value slot holds a tuple, packed
+                   ;   using the same composite-key-layout strategy
+                   ;   (each component a u64 except strings which take
+                   ;   their natural width). Userspace renders the
+                   ;   slot as `(v1, v2, …)' at print time.
+  value-tuple-types ; List of per-slot type hints (e.g. (:pid :str))
+                   ;   so the runtime printer can dispatch on each
+                   ;   component the same way it does for keys.
   needs-len-counter-p ; T when any `len(@m)' in the script targets
                    ;   this map. Triggers emission of a `__len_NAME'
                    ;   sidecar (1-entry percpu-array u64) and the
@@ -392,6 +400,21 @@
                    ;; concatenated param bytes (fentry/fexit: param-
                    ;; count × 8). Treat as a wide-byte value: track
                    ;; the size, mark needs-ptr-ops via wide value-size.
+                   ;; `@m = (a, b, …)' — tuple value. Use the same
+                   ;; per-component layout as composite-key-layout
+                   ;; (each component takes a u64 slot or a wider
+                   ;; string slot). Total bytes sized via the layout.
+                   ((and (consp rhs) (eq (first rhs) :tuple))
+                    (let* ((items  (getf (cdr rhs) :items)))
+                      (multiple-value-bind (_layout total)
+                          (composite-key-layout items)
+                        (declare (ignore _layout))
+                        (setf (minfo-kind info) :scalar
+                              (minfo-value-tuple-p info) t
+                              (minfo-value-tuple-types info)
+                              (mapcar #'key-hint items)
+                              (minfo-value-size info)
+                              (max (minfo-value-size info) total)))))
                    ((and (consp rhs) (eq (first rhs) :args)
                          (bare-args-byte-width))
                     (let ((w (bare-args-byte-width)))
@@ -4402,6 +4425,12 @@
       ((and (consp rhs) (eq (first rhs) :comm)
             (minfo-value-string-p info))
        (gen-comm-set info keys))
+      ;; `@m[k] = (a, b, …)' — tuple value. Allocate a value-sized
+      ;; buffer using composite-key-layout's planning, fill each
+      ;; slot, then map-update-ptr.
+      ((and (consp rhs) (eq (first rhs) :tuple)
+            (minfo-value-tuple-p info))
+       (gen-tuple-value-set info keys (getf (cdr rhs) :items)))
       ;; `@m[k] = args' (fentry/fexit) — the value is a freshly-
       ;; allocated buffer of param-count × 8 bytes. lower-bare-args
       ;; already emits the buffer + writes; route the resulting
@@ -4514,6 +4543,33 @@
                (whistler::get-current-comm ,buf ,vsize)
                (whistler::map-update-ptr
                 ,mname (whistler::stack-addr ,tmpk) ,buf 0)))))))
+
+(defun gen-tuple-value-set (info keys items)
+  "Store a tuple value into @MNAME[KEYS]. Layout matches what
+   composite-key-layout produces for keys — each ITEM lands in a
+   u64 slot (or wider for strings). Allocates the slot buffer once,
+   stores each component, then map-update-ptr."
+  (let* ((mname (minfo-name info))
+         (buf   (gensym "TVAL"))
+         (tmpk  (gensym "K"))
+         (ptr-p (keys-need-ptr-ops-p keys))
+         (vsize (minfo-value-size info)))
+    (multiple-value-bind (layout _total) (composite-key-layout items)
+      (declare (ignore _total))
+      (with-key keys
+        (lambda (k)
+          (let ((fills (loop for entry in layout
+                             for (off _size type expr) = entry
+                             collect (store-key-component buf off type expr))))
+            (if ptr-p
+                `(let ((,buf (whistler::struct-alloc ,vsize)))
+                   ,@fills
+                   (whistler::map-update-ptr ,mname ,k ,buf 0))
+                `(let* ((,tmpk whistler::u64 ,k)
+                        (,buf (whistler::struct-alloc ,vsize)))
+                   ,@fills
+                   (whistler::map-update-ptr
+                    ,mname (whistler::stack-addr ,tmpk) ,buf 0)))))))))
 
 (defun gen-array-field-set (info keys struct-ptr-form total-bytes field-offset)
   "Store the TOTAL-BYTES bytes at (STRUCT-PTR-FORM + FIELD-OFFSET) into
@@ -5407,13 +5463,17 @@
 
 (defun drop-tuple-assignments (stmts)
   "Drop \`\$v = (:tuple …)' statements from a body — the var is
-   implicit (callers reach the components directly via expand-tuple-vars)."
+   implicit (callers reach the components directly via expand-tuple-vars).
+   Map-assigns (`@m = (a, b)') stay because lower-map-assign emits the
+   actual storage via gen-tuple-value-set."
   (mapcar
    (lambda (s)
      (cond
        ((and (eq (first s) :assign)
-             (let ((rhs (getf (cdr s) :rhs)))
-               (and (consp rhs) (eq (first rhs) :tuple))))
+             (let ((lhs (getf (cdr s) :lhs))
+                   (rhs (getf (cdr s) :rhs)))
+               (and (consp lhs) (eq (first lhs) :var)
+                    (consp rhs) (eq (first rhs) :tuple))))
         '(:let-noop))
        ((eq (first s) :if)
         (list :if
@@ -6169,6 +6229,8 @@
                                     :key-array-elt-size (minfo-key-array-elt-size info)
                                     :key-array-len (minfo-key-array-len info)
                                     :keyed-p (minfo-keyed-p info)
+                                    :value-tuple-p (minfo-value-tuple-p info)
+                                    :value-tuple-types (minfo-value-tuple-types info)
                                     :value-size (minfo-value-size info)
                                     :max-entries (minfo-max-entries info)
                                     :hist-params (minfo-hist-params info)))))))
