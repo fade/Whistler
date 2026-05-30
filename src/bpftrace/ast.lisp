@@ -345,6 +345,7 @@
                                (norm-enum-decl inner)
                                nil)
                               (:union-decl   nil)  ; accept-and-ignore
+                              (:import-decl  nil)  ; accept-and-ignore
                               (:map-decl     nil)  ; accept-and-ignore
                               (t (error "unexpected top-form: ~S"
                                         (tag-of inner))))

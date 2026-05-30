@@ -171,7 +171,12 @@
 (defparameter *grammar-source*
   "
   script         = <ws> top-form (<ws> top-form)* <ws>
-  top-form       = function / macro-decl / config-block / map-decl / struct-decl / enum-decl / union-decl / probe
+  top-form       = function / macro-decl / config-block / map-decl / struct-decl / enum-decl / union-decl / import-decl / probe
+  (* `import \"stdlib/test\";' — bpftrace 0.22+ module import. We
+     accept-and-discard; downstream code only resolves what is
+     actually defined in this script, so calls into the imported
+     stdlib will still fail at codegen with a clearer message. *)
+  import-decl    = <'import'> <ws> string-lit <ws> <';'>
   (* `enum [NAME] { K1 = V1, K2, … };' at script top-level. Parsed
      into named members so bare-ident uses (`print(K1)') resolve to
      the matching integer. *)
