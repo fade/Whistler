@@ -36,6 +36,12 @@
   key-types        ; for composite keys: list of one keyword per slot
                    ;   (e.g. (:pid :ustack) for @[pid, ustack]).
                    ;   NIL for scalar single-slot keys.
+  key-bt-types     ; per-slot bpftrace surface type strings recorded
+                   ;   from the first assignment-shape access — e.g.
+                   ;   ("int8" "string[3]"). Used to diagnose
+                   ;   `has_key(@m, …)' arg mismatches against the
+                   ;   declared key shape. NIL when any slot type can't
+                   ;   be statically deduced.
   keyed-p          ; T iff any access used [keys]. Scalar-only `@m =`
                    ;   maps stay NIL so the printer skips the `[…]`.
   value-string-p   ; T when the value slot is a NUL-padded string of
@@ -363,6 +369,33 @@
                   (list :array sz len))))
     (t        nil)))
 
+(defun bt-key-arg-type-string (expr)
+  "Return the bpftrace surface type name for a single key arg literal
+   (int → int8/16/32/64, str → string[N+1]). Returns NIL when the type
+   cannot be deduced from the AST alone — callers treat NIL as
+   `unknown', skipping the typecheck rather than reporting a false
+   mismatch."
+  (case (first expr)
+    (:int
+     (let ((n (second expr)))
+       (cond ((and (>= n -128) (<= n 127)) "int8")
+             ((and (>= n -32768) (<= n 32767)) "int16")
+             ((and (>= n (- (ash 1 31))) (< n (ash 1 31))) "int32")
+             (t "int64"))))
+    (:str
+     (format nil "string[~D]" (1+ (length (second expr)))))
+    (t nil)))
+
+(defun bt-key-arity-string (args)
+  "Comma-joined bpftrace type names for ARGS, or NIL if any slot type
+   is unknown. The single-slot form is bare `int8' (no parens); the
+   composite form is `(int8,string[3])'."
+  (let ((tys (mapcar #'bt-key-arg-type-string args)))
+    (when (every #'identity tys)
+      (if (= (length tys) 1)
+          (first tys)
+          (format nil "(~{~A~^,~})" tys)))))
+
 (declaim (special *probe-spec*))
 
 (defun infer-maps (script)
@@ -469,7 +502,15 @@
                    (when (and (null (minfo-key-types info))
                               (> (length keys) 1))
                      (setf (minfo-key-types info)
-                           (mapcar #'key-hint keys))))))
+                           (mapcar #'key-hint keys)))
+                   ;; Record per-slot bpftrace surface types from the
+                   ;; first determinable-shape access — `has_key' uses
+                   ;; this to diagnose argument-type mismatches against
+                   ;; the declared key shape.
+                   (when (null (minfo-key-bt-types info))
+                     (let ((tys (mapcar #'bt-key-arg-type-string keys)))
+                       (when (every #'identity tys)
+                         (setf (minfo-key-bt-types info) tys)))))))
              (note-rhs (mref rhs)
                (let ((info (ensure mref)))
                  (cond
@@ -2693,6 +2734,28 @@
            (p     (gensym "P"))
            (k     (gensym "K"))
            (ptr-p (keys-need-ptr-ops-p keys)))
+      ;; Argument-shape typecheck. bpftrace rejects calls whose key
+      ;; arity or per-slot types don't match the map's declared key
+      ;; — emit the same `ERROR: Argument mismatch …' the runtime
+      ;; test suite expects. Only fires when both shapes are fully
+      ;; known (composite key recorded on the map, all access slots
+      ;; literal); otherwise stays out of the way.
+      (let* ((decl   (minfo-key-bt-types info))
+             (access (mapcar #'bt-key-arg-type-string keys)))
+        (when (and decl
+                   (every #'identity access)
+                   (or (/= (length decl) (length access))
+                       (some (lambda (a b) (not (string= a b)))
+                             decl access)))
+          (let ((decl-str (if (= (length decl) 1)
+                              (first decl)
+                              (format nil "(~{~A~^,~})" decl)))
+                (acc-str  (if (= (length access) 1)
+                              (first access)
+                              (format nil "(~{~A~^,~})" access))))
+            (unsupported
+             "ERROR: Argument mismatch for @~A: trying to access with arguments: '~A' when map expects arguments: '~A'"
+             mname-string acc-str decl-str))))
       (cond
         (ptr-p
          (with-key keys
