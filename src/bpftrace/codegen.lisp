@@ -681,6 +681,13 @@
    Distinct from *var-types* (struct names) so the existing
    struct-pointer code paths aren't disturbed.")
 
+(defvar *strftime-vars* nil
+  "Per-probe alist VAR-NAME → FMT-ID for vars holding `strftime()'
+   results. The wire format in the var slot is just the u64
+   timestamp; printf-arg-type substitutes a (:strftime . FMT-ID)
+   token when the var is referenced under a `%s' position so the
+   userspace decoder can strftime() it at print time.")
+
 (defvar *bool-vars* nil
   "Per-probe list of VAR-NAME strings whose latest assignment came
    from a bool source — `$v = true', `$v = false', `$v = (bool)X',
@@ -2583,6 +2590,14 @@
     ((and (eq (first expr) :var)
           (member (second expr) *comm-vars* :test #'string-equal))
      (cons :string +bt-comm-len+))
+    ;; A `\$v' assigned from `strftime(FMT, TS)' — the var holds the
+    ;; raw u64 timestamp; printf %s pulls the matching format-id
+    ;; back so the runtime strftime's it just like the bare
+    ;; strftime() arg form.
+    ((and (eq (first expr) :var)
+          (assoc (second expr) *strftime-vars* :test #'string=))
+     (cons :strftime
+           (cdr (assoc (second expr) *strftime-vars* :test #'string=))))
     ;; A field chain whose leaf is a fixed-size byte array
     ;; (e.g. `gendisk.disk_name' as `char[32]'). printf treats it
     ;; as a NUL-padded string of the array's byte size.
@@ -2848,9 +2863,16 @@
        `(whistler::store ,(intern "U32" :whistler) ,rec ,off ,errno-expr)))
     ((and (consp ty) (eq (car ty) :strftime))
      ;; Store the timestamp as a u64; the format-id is implicit in
-     ;; the printf-table's per-arg type list.
-     (let* ((args (getf (cdr arg) :args))
-            (ts-expr (lower-expr (second args))))
+     ;; the printf-table's per-arg type list. ARG is either:
+     ;;   * a `:call' strftime — pull the TS from the second arg, or
+     ;;   * a `:var' — the var already holds the TS (from a prior
+     ;;     `$v = strftime(...)' assignment).
+     (let ((ts-expr (cond
+                      ((and (consp arg) (eq (first arg) :call))
+                       (lower-expr (second (getf (cdr arg) :args))))
+                      ((and (consp arg) (eq (first arg) :var))
+                       (lower-expr arg))
+                      (t (lower-expr arg)))))
        `(whistler::store ,(intern "U64" :whistler) ,rec ,off ,ts-expr)))
     ((eq ty :ipv6)
      ;; 16 bytes copied from a pointer in user/kernel memory.
@@ -4025,6 +4047,15 @@
               `(let ((,ptr ,(lower-map-value-ptr rhs)))
                  (whistler::when ,ptr
                    (whistler::memcpy ,sym 0 ,ptr 0 ,total)))))
+           ;; `$v = strftime(FMT, TS)' — store the bare TS in $v; the
+           ;; FMT-ID got registered by infer-strftime-vars so a
+           ;; later `printf("%s", $v)' can substitute the right
+           ;; format string at decode time.
+           ((and (eq op :=)
+                 (consp rhs) (eq (first rhs) :call)
+                 (string= (getf (cdr rhs) :name) "strftime")
+                 (assoc (second lhs) *strftime-vars* :test #'string=))
+            `(setf ,sym ,(lower-expr (second (getf (cdr rhs) :args)))))
            ;; `$v = ntop(…)' on a tracked ntop-var — write the
            ;; family byte + address bytes into $v's pre-allocated
            ;; 17-byte slot. $v itself stays a pointer for the
@@ -5054,6 +5085,37 @@
     (t
      (intern "PROBE-READ-KERNEL" :whistler))))
 
+(defun infer-strftime-vars (stmts)
+  "Walk STMTS for `$v = strftime(\"FMT\", TS)' assignments and return
+   an alist (VAR-NAME . FMT-ID). The format string is interned in
+   *time-format-table* — same machinery as time() / strftime() in
+   printf-arg position. Subsequent printf %s on the var pulls the
+   FMT-ID back from this table."
+  (let ((acc nil))
+    (labels ((maybe-record (lhs rhs)
+               (when (and (consp lhs) (eq (first lhs) :var)
+                          (consp rhs) (eq (first rhs) :call)
+                          (string= (getf (cdr rhs) :name) "strftime"))
+                 (let* ((args (getf (cdr rhs) :args))
+                        (fmt  (and args (consp (first args))
+                                   (eq (first (first args)) :str)
+                                   (second (first args)))))
+                   (when fmt
+                     (let ((id (1+ (length *time-format-table*))))
+                       (push (cons id fmt) *time-format-table*)
+                       (pushnew (cons (second lhs) id) acc
+                                :test #'equal :key #'car))))))
+             (walk (s)
+               (case (first s)
+                 (:assign (maybe-record (getf (cdr s) :lhs)
+                                        (getf (cdr s) :rhs)))
+                 (:if     (mapc #'walk (getf (cdr s) :then))
+                          (mapc #'walk (getf (cdr s) :else)))
+                 (:while  (mapc #'walk (getf (cdr s) :body)))
+                 (:for    (mapc #'walk (getf (cdr s) :body))))))
+      (mapc #'walk stmts))
+    acc))
+
 (defun infer-bool-vars (stmts)
   "Walk STMTS for `$v = true/false/(bool)X/COMPARISON' assignments and
    return a list of VAR-NAME strings. Used by tuple-elem-printf-spec
@@ -5668,6 +5730,7 @@
            (*var-types*  (infer-var-types body))
            (*var-ptr-elt-types* (infer-var-ptr-elt-types body))
            (*var-array-types*   (infer-var-array-types body))
+           (*strftime-vars*     (infer-strftime-vars body))
            (*bool-vars*         (infer-bool-vars body))
            (*ntop-vars*  (infer-ntop-vars body))
            (*comm-vars*  (infer-comm-vars body))
