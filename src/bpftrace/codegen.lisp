@@ -5747,8 +5747,10 @@
                           (consp rhs)
                           (member (first rhs)
                                   '(:str :func :probe-name :comm)))
+                 ;; Anonymous maps (`@ = …') are keyed in *map-table*
+                 ;; under "@", not NIL — infer-maps coerces.
                  (let ((info (and *map-table*
-                                  (gethash (getf (cdr lhs) :name)
+                                  (gethash (or (getf (cdr lhs) :name) "@")
                                            *map-table*))))
                    (when info
                      (setf m (max m (minfo-value-size info)))))))
