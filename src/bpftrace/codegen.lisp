@@ -2813,6 +2813,15 @@
        (lower-printf (list (list :str (concatenate 'string "%s"
                                                    (string #\Newline)))
                            val)))
+      ;; `print(str(p))' / `print(kstr(p))' / `print(comm)' — the call
+      ;; produces a string slot, not a number. Without this, the default
+      ;; branch picks "%d" and the runtime formatter dies trying to
+      ;; render the string bytes as an integer.
+      ((or (str-call-p val) (kstr-call-p val)
+           (eq tag :comm) (eq tag :pcomm))
+       (lower-printf (list (list :str (concatenate 'string "%s"
+                                                   (string #\Newline)))
+                           val)))
       ((eq tag :tuple)
        (multiple-value-bind (fmt-fragment leaves) (tuple-printf-shape val)
          (lower-printf (cons (list :str
