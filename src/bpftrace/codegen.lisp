@@ -681,6 +681,13 @@
    Distinct from *var-types* (struct names) so the existing
    struct-pointer code paths aren't disturbed.")
 
+(defvar *bool-vars* nil
+  "Per-probe list of VAR-NAME strings whose latest assignment came
+   from a bool source — `$v = true', `$v = false', `$v = (bool)X',
+   or a comparison result. tuple-elem-printf-spec checks this list
+   to emit `%B' instead of `%d' so the userspace renderer prints
+   `true'/`false' instead of `1'/`0'.")
+
 (defvar *var-array-types* nil
   "Per-probe alist VAR-NAME → (ELT-SIZE ARR-LEN) for vars assigned
    from a map whose value-array-p is set — e.g. `$x = @a[0]' where
@@ -2725,7 +2732,9 @@
               (or (string= (second elem) "true")
                   (string= (second elem) "false")))
          (and (consp elem) (eq (first elem) :int-cast)
-              (string= (getf (cdr elem) :type) "bool")))
+              (string= (getf (cdr elem) :type) "bool"))
+         (and (consp elem) (eq (first elem) :var)
+              (member (second elem) *bool-vars* :test #'string=)))
      "%B")
     (t  "%d")))
 
@@ -5027,6 +5036,37 @@
     (t
      (intern "PROBE-READ-KERNEL" :whistler))))
 
+(defun infer-bool-vars (stmts)
+  "Walk STMTS for `$v = true/false/(bool)X/COMPARISON' assignments and
+   return a list of VAR-NAME strings. Used by tuple-elem-printf-spec
+   to flag bool-typed vars so they render as `true'/`false'."
+  (let ((acc nil))
+    (labels ((bool-rhs-p (rhs)
+               (and (consp rhs)
+                    (or (and (eq (first rhs) :constant)
+                             (or (string= (second rhs) "true")
+                                 (string= (second rhs) "false")))
+                        (and (eq (first rhs) :int-cast)
+                             (string= (getf (cdr rhs) :type) "bool"))
+                        (and (eq (first rhs) :bin)
+                             (member (getf (cdr rhs) :op)
+                                     '(:== :!= :< :> :<= :>=
+                                       :&& :\|\|))))))
+             (maybe-record (lhs rhs)
+               (when (and (consp lhs) (eq (first lhs) :var)
+                          (bool-rhs-p rhs))
+                 (pushnew (second lhs) acc :test #'string=)))
+             (walk (s)
+               (case (first s)
+                 (:assign (maybe-record (getf (cdr s) :lhs)
+                                        (getf (cdr s) :rhs)))
+                 (:if     (mapc #'walk (getf (cdr s) :then))
+                          (mapc #'walk (getf (cdr s) :else)))
+                 (:while  (mapc #'walk (getf (cdr s) :body)))
+                 (:for    (mapc #'walk (getf (cdr s) :body))))))
+      (mapc #'walk stmts))
+    acc))
+
 (defun infer-var-array-types (stmts)
   "Walk STMTS for `$v = @m[k]' where @m's minfo carries value-array-p
    (set by infer-maps when the script stored a whole-array field as
@@ -5610,6 +5650,7 @@
            (*var-types*  (infer-var-types body))
            (*var-ptr-elt-types* (infer-var-ptr-elt-types body))
            (*var-array-types*   (infer-var-array-types body))
+           (*bool-vars*         (infer-bool-vars body))
            (*ntop-vars*  (infer-ntop-vars body))
            (*comm-vars*  (infer-comm-vars body))
            (*str-vars*   (infer-str-vars body))
