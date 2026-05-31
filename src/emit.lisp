@@ -598,6 +598,27 @@
        ((integerp arg)
         (let ((src-phys (vreg-to-physical ctx arg whistler/bpf:+bpf-reg-1+)))
           (store-to-vreg ctx dst src-phys)))
+       ;; (:btf-id N) — load the address of a BTF-typed kernel symbol
+       ;; (e.g. a `__percpu' variable). Encoded as ld_imm64 with
+       ;; src_reg=BPF_PSEUDO_BTF_ID; the kernel resolves the address
+       ;; at program load and types the destination as the symbol's
+       ;; actual percpu_ptr_<T>, not a plain scalar.
+       ((and (consp arg) (eq (first arg) :btf-id))
+        (let* ((btf-id (second arg))
+               (dst-loc (allocate-vreg ctx dst)))
+          (ecase (car dst-loc)
+            (:reg
+             (ectx-emit ctx (whistler/bpf:emit-ld-btf-id (cadr dst-loc) btf-id)))
+            (:stack
+             ;; Materialise into R0 then spill, matching how 64-bit
+             ;; literals do it. ld_imm64 lands the typed pointer in
+             ;; R0 first, store-to-stack happens after.
+             (let ((tmp whistler/bpf:+bpf-reg-0+))
+               (ectx-emit ctx (whistler/bpf:emit-ld-btf-id tmp btf-id))
+               (ectx-emit ctx (whistler/bpf:emit-stx-mem
+                               whistler/bpf:+bpf-dw+
+                               whistler/bpf:+bpf-reg-10+ tmp
+                               (cadr dst-loc))))))))
        ((consp arg)
         (let ((imm (imm-arg-value arg)))
           (when imm

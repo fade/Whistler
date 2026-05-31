@@ -304,7 +304,7 @@
     "RINGBUF-RESERVE" "RINGBUF-SUBMIT" "RINGBUF-DISCARD"
     "STACK-ADDR" "CAST" "NOT" "WHEN" "UNLESS" "COND" "AND" "OR" "LOG2"
     "SETF" "DOTIMES" "NTOHS" "HTONS" "NTOHL" "HTONL" "NTOHLL" "HTONLL"
-    "TAIL-CALL" "ASM" "DECLARE")
+    "TAIL-CALL" "ASM" "DECLARE" "LD-BTF-ID")
   "Form names handled by Whistler. Do not macroexpand these.")
 
 ;; ALU and comparison operator names (used by whistler-builtin-p to prevent

@@ -233,6 +233,21 @@
          (ctx-emit ctx :ret nil (list val))
          nil))
 
+      ;; (ld-btf-id BTF-ID) — emit ld_imm64 with src_reg=BPF_PSEUDO_BTF_ID.
+      ;; The kernel resolves BTF-ID at load time and the verifier types
+      ;; the destination as the symbol's actual percpu_ptr_<T> rather
+      ;; than a scalar. Used by lower-percpu-kaddr-call so
+      ;; bpf_per_cpu_ptr accepts R1.
+      ((sym= head 'ld-btf-id)
+       (unless (and args (integerp (first args)))
+         (whistler/compiler:whistler-error
+          :what "ld-btf-id requires a constant BTF type id"
+          :where (format nil "(ld-btf-id ~s)" (first args))
+          :expected "(ld-btf-id INTEGER-CONSTANT)"))
+       (let ((v (ctx-fresh-vreg ctx)))
+         (ctx-emit ctx :mov v (list `(:btf-id ,(first args))) 'u64)
+         v))
+
       ;; CL ash: (ash value count) — left shift if count > 0, right if < 0
       ((sym= head 'ash)
        (let ((count (second args)))

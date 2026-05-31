@@ -2746,25 +2746,37 @@
     addr))
 
 (defun lower-percpu-kaddr-call (args)
-  "Lower percpu_kaddr(\"name\") or percpu_kaddr(\"name\", cpu) — looks
-   up the per-CPU symbol in /proc/kallsyms then calls
-   bpf_per_cpu_ptr(ptr, cpu) to materialise the per-CPU instance's
-   address. With no CPU arg, defaults to the current CPU."
+  "Lower percpu_kaddr(\"name\") / percpu_kaddr(\"name\", cpu). The
+   verifier rejects bpf_per_cpu_ptr called with a plain literal
+   address (R1 type=scalar), so we look the symbol up in vmlinux BTF
+   and emit an ld_imm64 with src_reg=BPF_PSEUDO_BTF_ID — the kernel
+   patches the address at load time AND the verifier marks R1 as
+   percpu_ptr_<T>. Falls back to the kallsyms literal for symbols
+   that aren't in BTF (older kernels or non-percpu uses), but the
+   per-cpu helper will still reject those at load."
   (unless (and args (consp (first args))
                (eq (first (first args)) :str)
                (or (= 1 (length args)) (= 2 (length args))))
     (unsupported "percpu_kaddr() takes (\"name\" [, cpu])"))
-  (unless *kallsyms-addr-cache*
-    (setf *kallsyms-addr-cache* (load-kallsyms-addrs)))
   (let* ((name (second (first args)))
-         (addr (gethash name *kallsyms-addr-cache*))
          (cpu  (if (cdr args)
                    (lower-expr (second args))
-                   '(whistler::get-smp-processor-id))))
-    (unless addr
-      (unsupported "percpu_kaddr(~S) — symbol not found in /proc/kallsyms"
-                   name))
-    `(whistler::per-cpu-ptr ,addr ,cpu)))
+                   '(whistler::get-smp-processor-id)))
+         (btf-id (handler-case
+                     (whistler:btf-find-var
+                      (whistler:ensure-vmlinux-btf) name)
+                   (error () nil))))
+    (cond
+      (btf-id
+       `(whistler::per-cpu-ptr (whistler::ld-btf-id ,btf-id) ,cpu))
+      (t
+       (unless *kallsyms-addr-cache*
+         (setf *kallsyms-addr-cache* (load-kallsyms-addrs)))
+       (let ((addr (gethash name *kallsyms-addr-cache*)))
+         (unless addr
+           (unsupported "percpu_kaddr(~S) — symbol not found in vmlinux BTF or /proc/kallsyms"
+                        name))
+         `(whistler::per-cpu-ptr ,addr ,cpu))))))
 
 (defun lower-has-key-call (args)
   "Lower `has_key(@map, key…)' to 1 if `bpf_map_lookup_elem' returns

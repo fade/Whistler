@@ -117,6 +117,21 @@
                     (string= (btf-string strtab (getf rec :name-off)) name))
           return (values id rec))))
 
+(defun btf-find-var (vmbtf name)
+  "Find a BTF VAR (a kernel symbol with BTF type info) by name. Returns
+   the BTF type-id, or NIL. Used by lower-percpu-kaddr-call to emit an
+   ld_imm64 with src_reg=BPF_PSEUDO_BTF_ID — the verifier then types
+   the destination register as the symbol's actual percpu_ptr_<T>
+   instead of a plain scalar."
+  (let ((strtab (vmlinux-btf-strtab vmbtf))
+        (types (vmlinux-btf-types vmbtf)))
+    (loop for id from 1 below (length types)
+          for rec = (aref types id)
+          when (and rec
+                    (= (getf rec :kind) +btf-kind-var+)
+                    (string= (btf-string strtab (getf rec :name-off)) name))
+            return id)))
+
 (defun btf-find-func (vmbtf name)
   "Find a kernel FUNC by name. Returns (values FUNC-ID NARGS), or NIL.
    NARGS is read from the linked FUNC_PROTO's vlen."

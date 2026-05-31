@@ -80,6 +80,12 @@
 
 ;; Pseudo source for 64-bit imm
 (defconstant +bpf-pseudo-map-fd+ 1)
+;; src_reg=3 in ld_imm64 marks the immediate as a BTF type-id reference.
+;; The kernel resolves it at program load time: the BTF type's symbol
+;; address replaces the imm, and the verifier types the destination
+;; register as the symbol's actual type (e.g. PERCPU_PTR_<T>) instead
+;; of a plain scalar. Required for `bpf_per_cpu_ptr' to accept R1.
+(defconstant +bpf-pseudo-btf-id+ 3)
 
 ;; Map types
 (defconstant +bpf-map-type-hash+          1)
@@ -208,6 +214,21 @@
               (logand fd #xffffffff))
         (insn 0 0 0 0
               (logand (ash fd -32) #xffffffff))))
+
+(defun emit-ld-btf-id (dst btf-id &optional (btf-obj-fd 0))
+  "Emit a 64-bit immediate load whose value the kernel resolves from
+   BTF at program load. DST gets the address of the symbol named by
+   BTF-ID; the verifier marks DST with the BTF type's actual pointer
+   type (e.g. PERCPU_PTR_<struct foo>). BTF-OBJ-FD is the BTF object
+   FD (0 = vmlinux); only nonzero when targeting a kernel module's
+   BTF blob.
+
+   Encoding: first slot has src_reg=+BPF_PSEUDO_BTF_ID+, imm=btf_id;
+   second slot's imm carries btf_obj_fd."
+  (list (insn (logior +bpf-ld+ +bpf-dw+ +bpf-imm+) dst +bpf-pseudo-btf-id+ 0
+              (logand btf-id #xffffffff))
+        (insn 0 0 0 0
+              (logand btf-obj-fd #xffffffff))))
 
 ;;; Encoding to bytes
 

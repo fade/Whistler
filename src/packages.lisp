@@ -20,7 +20,8 @@
    #:emit-stx-atomic
    #:emit-jmp-reg #:emit-jmp-imm #:emit-jmp-a
    #:emit-call #:emit-exit
-   #:emit-ld-imm64 #:emit-ld-map-fd
+   #:emit-ld-imm64 #:emit-ld-map-fd #:emit-ld-btf-id
+   #:+bpf-pseudo-btf-id+
    ;; Constants
    #:+bpf-reg-0+ #:+bpf-reg-1+ #:+bpf-reg-2+ #:+bpf-reg-3+ #:+bpf-reg-4+
    #:+bpf-reg-5+ #:+bpf-reg-6+ #:+bpf-reg-7+ #:+bpf-reg-8+ #:+bpf-reg-9+
@@ -155,7 +156,8 @@
            #:deftracepoint #:import-kernel-struct
            #:reset-vmlinux-btf-cache
            #:btf-find-func #:btf-func-params #:btf-enum-values
-           #:btf-find-struct #:btf-struct-fields #:btf-struct-size #:btf-resolve-array
+           #:btf-find-struct #:btf-find-var
+           #:btf-struct-fields #:btf-struct-size #:btf-resolve-array
            #:btf-ptr-target-type-id #:btf-type-name
            #:btf-member-raw-type-id #:ensure-vmlinux-btf
            ;; Memory operations
