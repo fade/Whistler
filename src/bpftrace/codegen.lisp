@@ -44,6 +44,12 @@
                    ;   be statically deduced.
   keyed-p          ; T iff any access used [keys]. Scalar-only `@m =`
                    ;   maps stay NIL so the printer skips the `[…]`.
+  value-unsigned-p ; T when the map's value type is unsigned — the
+                   ;   userspace printer renders the slot as u64 instead
+                   ;   of int64. Set when RHS is bitwise NOT (`~x'
+                   ;   produces uint64 per bpftrace's type rules) or
+                   ;   any other expression that's known to produce an
+                   ;   unsigned result. Default NIL = signed (int64).
   value-string-p   ; T when the value slot is a NUL-padded string of
                    ;   `value-size' bytes (set by inference from a
                    ;   string-typed RHS — :str / :func / :probe-name).
@@ -513,6 +519,14 @@
                          (setf (minfo-key-bt-types info) tys)))))))
              (note-rhs (mref rhs)
                (let ((info (ensure mref)))
+                 ;; `@m = ~X' produces an unsigned value (bpftrace's
+                 ;; bitwise NOT is the only common unary that flips
+                 ;; the result to uint64). Mark so the userspace
+                 ;; printer renders as u64 instead of int64 — e.g.
+                 ;; `@x = ~10' → 18446744073709551605, not -11.
+                 (when (and (consp rhs) (eq (first rhs) :un)
+                            (eq (getf (cdr rhs) :op) :~))
+                   (setf (minfo-value-unsigned-p info) t))
                  (cond
                    ;; `@m[k] = (struct X *)expr' — remember the value
                    ;; type so a later `\$v = @m[k]' can flow X into
@@ -2770,6 +2784,14 @@
            (p     (gensym "P"))
            (k     (gensym "K"))
            (ptr-p (keys-need-ptr-ops-p keys)))
+      ;; Scalar-map check. `@g = 2' makes @g a scalar map with no key
+      ;; slot; bpftrace rejects `has_key(@g, …)' on those at type-
+      ;; check time. minfo-keyed-p is NIL until something records a
+      ;; key access shape.
+      (unless (minfo-keyed-p info)
+        (unsupported
+         "ERROR: has_key() expects a map with keys, but @~A is a scalar map"
+         mname-string))
       ;; Argument-shape typecheck. bpftrace rejects calls whose key
       ;; arity or per-slot type *family* doesn't match the map's
       ;; declared key — emit the same `ERROR: Argument mismatch …'
@@ -7420,6 +7442,7 @@
                                     (and (minfo-value-array-p info)
                                          (minfo-value-array-dims info))
                                     :keyed-p (minfo-keyed-p info)
+                                    :value-unsigned-p (minfo-value-unsigned-p info)
                                     :value-tuple-p (minfo-value-tuple-p info)
                                     :value-tuple-types (minfo-value-tuple-types info)
                                     :value-strftime-id (minfo-value-strftime-id info)

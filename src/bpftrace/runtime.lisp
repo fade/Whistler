@@ -910,6 +910,7 @@
                                           value-array-dims
                                           value-tuple-p value-tuple-types
                                           value-strftime-id key-strftime-id
+                                          value-unsigned-p
                                           time-format-table
                                           top div
                                           stacks-info stack-depth
@@ -1045,7 +1046,8 @@
                      (t (format-scalar-value (cdr kv)
                                               :array-elt-size value-array-elt-size
                                               :array-len value-array-len
-                                              :array-dims value-array-dims))))))
+                                              :array-dims value-array-dims
+                                              :unsigned-p value-unsigned-p))))))
         (t
          (dolist (kv pairs)
            (format t "~A: ~A~%"
@@ -1060,7 +1062,8 @@
                      (t (format-scalar-value (cdr kv)
                                               :array-elt-size value-array-elt-size
                                               :array-len value-array-len
-                                              :array-dims value-array-dims))))))))))
+                                              :array-dims value-array-dims
+                                              :unsigned-p value-unsigned-p))))))))))
 
 (defun json-format-scalar-value (v)
   "JSON-encode a scalar map value cell. Integers go bare; strings
@@ -1074,14 +1077,18 @@
     ((stringp v) (format nil "~S" v))
     (t (format nil "~D" v))))
 
-(defun format-scalar-value (v &key array-elt-size array-len array-dims)
+(defun format-scalar-value (v &key array-elt-size array-len array-dims
+                                    unsigned-p)
   "Render a scalar map's value cell. Most values are integers; stats()
    threads a (:stats COUNT SUM) sentinel that pretty-prints as
    `count NN, average AA, total TT`, mirroring bpftrace. A plain
    list (no leading keyword) is a tuple value (`@m = (a, b)') which
    renders as `(a, b)'. ARRAY-ELT-SIZE + ARRAY-LEN render the value's
    little-endian bytes as `[v1,v2,…]' — used when the map's value
-   slot holds an in-script struct array field."
+   slot holds an in-script struct array field. UNSIGNED-P means
+   render the integer as u64 (`~10' produces 18446744073709551605,
+   not -11) — bpftrace tracks signed/unsigned per map; we only flip
+   on signals like bitwise NOT at infer time."
   (cond
     ((and (consp v) (eq (first v) :stats))
      (let ((c (second v))
@@ -1105,7 +1112,7 @@
                   do (when (plusp i) (write-char #\, s))
                      (format s "~D" cell)))
           (write-char #\] s)))))
-    (t (format nil "~D" (signed-64 v)))))
+    (t (format nil "~D" (if unsigned-p v (signed-64 v))))))
 
 (defun print-all-maps (info-list map-alist &key stacks-info stack-depth
                                                 symbolizer time-format-table)
@@ -1152,6 +1159,8 @@
                                    (getf (cdr info-rec) :value-strftime-id)
                                    :key-strftime-id
                                    (getf (cdr info-rec) :key-strftime-id)
+                                   :value-unsigned-p
+                                   (getf (cdr info-rec) :value-unsigned-p)
                                    :time-format-table time-format-table
                                    :kind kind
                                    :stacks-info stacks-info
@@ -2097,6 +2106,10 @@
                    ;; exits in this shape — there are no probes to
                    ;; service.
                    (setf *bpftrace-running* t)
+                   ;; Capture an exit() that fired during BEGIN even
+                   ;; when we skip the poll loop — otherwise `begin {
+                   ;; exit(69); }' falls through to a 0 exit code.
+                   (exit-flag-set-p exit-info)
                    (when (or atts *child-process*)
                      (handler-case
                          (loop while (and *bpftrace-running*

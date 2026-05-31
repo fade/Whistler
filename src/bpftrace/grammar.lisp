@@ -368,7 +368,7 @@
   shift          = add (<ws> ('<<' / '>>') <ws> add)*
   add            = mul (<ws> ('+' / '-') <ws> mul)*
   mul            = unary (<ws> ('*' / '/' / '%') <ws> unary)*
-  unary          = unary-op <ws> unary / prefix-incdec <ws> postfix / postfix
+  unary          = prefix-incdec <ws> postfix / unary-op <ws> unary / postfix
   (* `*EXPR' is a u64 pointer dereference — common in tools that
      read kernel global symbols, e.g. *kaddr(\"avenrun\"). *)
   unary-op       = '!' / '-' / '~' / '*'
